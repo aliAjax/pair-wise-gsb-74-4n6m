@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 import {
   AddIcon,
@@ -10,6 +10,7 @@ import {
 } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import EventTree from '@/components/EventTree.vue'
+import BatchScopeBar from '@/components/BatchScopeBar.vue'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useEventsQuery } from '@/composables/useGovernanceQueries'
@@ -20,7 +21,8 @@ import type {
   PlatformRule,
   PropertyType,
 } from '@/models/domain'
-import { createId } from '@/services/repository'
+import { createId } from '@/services/id'
+import { platformLabel } from '@/services/batch'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -34,12 +36,39 @@ const filters = reactive({
 })
 const filterRef = computed(() => ({ ...filters }))
 const eventsQuery = useEventsQuery(filterRef)
-const events = computed(() => eventsQuery.data.value ?? store.data.events)
 
-const selectedId = ref(store.data.events[0]?.id ?? '')
+const scopedBatch = computed(() =>
+  store.scope.platform
+    ? store.data.releases
+        .find((release) => release.id === store.scope.releaseId)
+        ?.batches.find((batch) => batch.platform === store.scope.platform) ?? null
+    : null,
+)
+const scopedEventIds = computed(() => {
+  if (!store.scope.releaseId) return null
+  const release = store.data.releases.find((item) => item.id === store.scope.releaseId)
+  if (!release) return null
+  return scopedBatch.value ? scopedBatch.value.eventIds : release.eventIds
+})
+const scopedPlatform = computed(() => scopedBatch.value?.platform ?? null)
+
+const allEvents = computed(() => eventsQuery.data.value ?? store.data.events)
+const events = computed(() =>
+  scopedEventIds.value
+    ? allEvents.value.filter((event) => scopedEventIds.value!.includes(event.id))
+    : allEvents.value,
+)
+
+const selectedId = ref(events.value[0]?.id ?? '')
 const selectedEvent = computed(
   () => store.data.events.find((event) => event.id === selectedId.value) ?? null,
 )
+
+watch(events, (list) => {
+  if (list.length > 0 && !list.some((event) => event.id === selectedId.value)) {
+    selectedId.value = list[0]!.id
+  }
+})
 const eventEditorVisible = ref(false)
 const propertyEditorVisible = ref(false)
 const platformEditorVisible = ref(false)
@@ -309,6 +338,31 @@ const setEnumValues = (value: unknown): void => {
 const setPlatform = (value: unknown): void => {
   platformForm.platform = value as Platform
 }
+
+const scopedProperties = computed(() =>
+  selectedEvent.value
+    ? selectedEvent.value.properties.filter(
+        (property) =>
+          !property.deletedAt && (!scopedPlatform.value || property.platforms.includes(scopedPlatform.value)),
+      )
+    : [],
+)
+
+const scopedRules = computed(() =>
+  selectedEvent.value
+    ? selectedEvent.value.platformRules.filter(
+        (rule) => !scopedPlatform.value || rule.platform === scopedPlatform.value,
+      )
+    : [],
+)
+
+const scopeTagText = computed(() =>
+  scopedBatch.value
+    ? `${platformLabel(scopedBatch.value.platform)} 端批次范围`
+    : store.scope.releaseId
+      ? '发布候选汇总范围'
+      : '',
+)
 </script>
 
 <template>
@@ -316,8 +370,10 @@ const setPlatform = (value: unknown): void => {
     <PageHeader
       eyebrow="契约目录"
       title="事件树与契约编辑"
-      description="按业务域维护事件、属性、枚举、多端触发规则和负责人，所有编辑均进入版本差异。"
+      description="按业务域维护事件、属性、枚举、多端触发规则和负责人；事件树按所选端批次展示，编辑后仅重算受影响端。"
     />
+
+    <BatchScopeBar />
 
     <section class="panel filter-panel">
       <div class="toolbar-row">
@@ -429,7 +485,7 @@ const setPlatform = (value: unknown): void => {
           </div>
           <t-table
             row-key="id"
-            :data="selectedEvent.properties.filter((property) => !property.deletedAt)"
+            :data="scopedProperties"
             :columns="propertyColumns"
             size="small"
             stripe
@@ -476,19 +532,18 @@ const setPlatform = (value: unknown): void => {
 
         <section class="panel">
           <div class="panel-header">
-            <h2 class="panel-title">平台差异</h2>
+            <h2 class="panel-title">
+              平台差异
+              <t-tag v-if="scopeTagText" theme="primary" variant="light" size="small" class="scope-tag">
+                {{ scopeTagText }}
+              </t-tag>
+            </h2>
             <t-button theme="primary" variant="outline" @click="openRuleEditor()">
               <template #icon><AddIcon /></template>
               新增平台规则
             </t-button>
           </div>
-          <t-table
-            row-key="id"
-            :data="selectedEvent.platformRules"
-            :columns="ruleColumns"
-            size="small"
-            stripe
-          >
+          <t-table row-key="id" :data="scopedRules" :columns="ruleColumns" size="small" stripe>
             <template #enabled="{ row }">
               <StatusTag :value="row.enabled ? 'active' : 'disabled'" />
             </template>
@@ -672,6 +727,10 @@ const setPlatform = (value: unknown): void => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.scope-tag {
+  margin-left: 8px;
 }
 
 .keyword-field {

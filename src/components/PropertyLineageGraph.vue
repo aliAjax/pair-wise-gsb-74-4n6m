@@ -1,17 +1,21 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { DownstreamDependency, EventDefinition, EventProperty } from '@/models/domain'
+import type { DownstreamDependency, EventDefinition, EventProperty, Platform } from '@/models/domain'
 
 const props = defineProps<{
   events: EventDefinition[]
   dependencies: DownstreamDependency[]
   selectedPropertyId: string
+  platform?: Platform | null
 }>()
 
 const allProperties = computed(() =>
   props.events.flatMap((event) =>
     event.properties
-      .filter((property) => !property.deletedAt)
+      .filter(
+        (property) =>
+          !property.deletedAt && (!props.platform || property.platforms.includes(props.platform)),
+      )
       .map((property) => ({ event, property })),
   ),
 )

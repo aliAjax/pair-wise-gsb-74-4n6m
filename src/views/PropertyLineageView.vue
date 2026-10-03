@@ -7,21 +7,57 @@ import {
   LinkIcon,
 } from 'tdesign-icons-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
+import BatchScopeBar from '@/components/BatchScopeBar.vue'
 import PropertyLineageGraph from '@/components/PropertyLineageGraph.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useLineageQuery } from '@/composables/useGovernanceQueries'
+import type { Platform } from '@/models/domain'
+import { platformLabel } from '@/services/batch'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
 const lineageQuery = useLineageQuery()
 
-const selectedEventId = ref(store.data.events[0]?.id ?? '')
-const selectedPropertyId = ref(store.data.events[0]?.properties[0]?.id ?? '')
-const events = computed(() => lineageQuery.data.value?.events ?? store.data.events)
-const dependencies = computed(() => lineageQuery.data.value?.dependencies ?? store.data.dependencies)
+const scopedBatch = computed(() =>
+  store.scope.platform
+    ? store.data.releases
+        .find((release) => release.id === store.scope.releaseId)
+        ?.batches.find((batch) => batch.platform === store.scope.platform) ?? null
+    : null,
+)
+const scopedEventIds = computed<string[] | null>(() => {
+  if (!store.scope.releaseId) return null
+  const release = store.data.releases.find((item) => item.id === store.scope.releaseId)
+  if (!release) return null
+  return scopedBatch.value ? scopedBatch.value.eventIds : release.eventIds
+})
+const scopedPlatform = computed<Platform | null>(() => scopedBatch.value?.platform ?? null)
+
+const rawEvents = computed(() => lineageQuery.data.value?.events ?? store.data.events)
+const rawDependencies = computed(
+  () => lineageQuery.data.value?.dependencies ?? store.data.dependencies,
+)
+const events = computed(() =>
+  scopedEventIds.value
+    ? rawEvents.value.filter((event) => scopedEventIds.value!.includes(event.id))
+    : rawEvents.value,
+)
+const dependencies = computed(() =>
+  scopedBatch.value
+    ? rawDependencies.value.filter((dependency) =>
+        scopedBatch.value!.affectedDependencyIds.includes(dependency.id),
+      )
+    : rawDependencies.value,
+)
+
+const selectedEventId = ref(events.value[0]?.id ?? '')
+const selectedPropertyId = ref(events.value[0]?.properties[0]?.id ?? '')
 const selectedEvent = computed(() => events.value.find((event) => event.id === selectedEventId.value))
-const properties = computed(
-  () => selectedEvent.value?.properties.filter((property) => !property.deletedAt) ?? [],
+const properties = computed(() =>
+  selectedEvent.value?.properties.filter(
+    (property) =>
+      !property.deletedAt && (!scopedPlatform.value || property.platforms.includes(scopedPlatform.value)),
+  ) ?? [],
 )
 const selectedProperty = computed(
   () => properties.value.find((property) => property.id === selectedPropertyId.value) ?? null,
@@ -47,6 +83,12 @@ watch(selectedEventId, () => {
   selectedPropertyId.value = properties.value[0]?.id ?? ''
 })
 
+watch(events, (list) => {
+  if (list.length > 0 && !list.some((event) => event.id === selectedEventId.value)) {
+    selectedEventId.value = list[0]!.id
+  }
+})
+
 const statusOf = (status: string): string =>
   status === 'migrated' || status === 'active' ? 'active' : 'migration_required'
 </script>
@@ -56,8 +98,10 @@ const statusOf = (status: string): string =>
     <PageHeader
       eyebrow="属性治理"
       title="属性血缘与下游影响"
-      description="沿属性继承关系查看跨事件传播，并定位使用该字段的数据看板、告警、模型和数据集。"
+      description="血缘图与下游引用按所选端批次展示；沿属性继承查看跨事件传播，定位看板、告警、模型和数据集。"
     />
+
+    <BatchScopeBar />
 
     <section class="panel lineage-controls">
       <div class="toolbar-row">
@@ -113,13 +157,19 @@ const statusOf = (status: string): string =>
 
     <section class="panel">
       <div class="panel-header">
-        <h2 class="panel-title">血缘图</h2>
+        <h2 class="panel-title">
+          血缘图
+          <t-tag v-if="scopedBatch" theme="primary" variant="light" size="small" class="scope-tag">
+            {{ platformLabel(scopedBatch.platform) }} 端批次
+          </t-tag>
+        </h2>
         <span class="muted">选取属性后自动展开跨事件继承及下游引用</span>
       </div>
       <PropertyLineageGraph
         :events="events"
         :dependencies="dependencies"
         :selected-property-id="selectedPropertyId"
+        :platform="scopedPlatform"
       />
     </section>
 
@@ -166,6 +216,10 @@ const statusOf = (status: string): string =>
 <style scoped>
 .lineage-controls {
   padding: 14px 16px;
+}
+
+.scope-tag {
+  margin-left: 8px;
 }
 
 .event-field {

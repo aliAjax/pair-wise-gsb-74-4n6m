@@ -2,9 +2,11 @@ import axios, { type AxiosAdapter } from 'axios'
 import type {
   DownstreamDependency,
   EventDefinition,
+  PlatformBatch,
   ReleaseCandidate,
   ValidationIssue,
 } from '@/models/domain'
+import { batchReadiness } from '@/services/batch'
 import { loadState } from '@/services/repository'
 import { validateGovernance } from '@/services/selectors'
 
@@ -24,6 +26,11 @@ export interface DashboardPayload {
   validationIssueCount: number
   criticalIssueCount: number
   currentRelease: ReleaseCandidate | null
+  batchTotal: number
+  batchPublished: number
+  batchBlocked: number
+  batchFailed: number
+  topReadiness: number
 }
 
 export interface LineagePayload {
@@ -39,6 +46,25 @@ const localAdapter: AxiosAdapter = async (config) => {
     const issues = validateGovernance(state)
     const currentRelease =
       state.releases.find((release) => release.status === 'reviewing') ?? state.releases[0] ?? null
+    const activeBatches = state.releases.flatMap((release) =>
+      release.batches.filter((batch) => batch.status !== 'rolled_back'),
+    )
+    const pendingBatches = activeBatches.filter(
+      (batch) => batch.migrationConfirmations.some((item) => item.status !== 'confirmed'),
+    )
+    const batchPublished = activeBatches.filter((batch) => batch.status === 'published').length
+    const batchFailed = activeBatches.filter(
+      (batch) => batch.status === 'publish_failed',
+    ).length
+    const batchBlocked = activeBatches.filter(
+      (batch) =>
+        batch.status === 'reviewing' &&
+        (batch.migrationConfirmations.some((item) => item.status !== 'confirmed') ||
+          batch.approvals.some((item) => item.status !== 'approved')),
+    ).length
+    const readinessValues = activeBatches.map((batch: PlatformBatch) =>
+      batchReadiness(batch, issues),
+    )
     const data: DashboardPayload = {
       eventCount: state.events.length,
       activeEventCount: state.events.filter((event) =>
@@ -48,11 +74,15 @@ const localAdapter: AxiosAdapter = async (config) => {
         ['draft', 'reviewing'].includes(event.status),
       ).length,
       dependencyCount: state.dependencies.length,
-      pendingMigrations:
-        currentRelease?.migrationConfirmations.filter((item) => item.status === 'pending').length ?? 0,
+      pendingMigrations: pendingBatches.length,
       validationIssueCount: issues.length,
       criticalIssueCount: issues.filter((issue) => issue.severity === 'critical').length,
       currentRelease,
+      batchTotal: activeBatches.length,
+      batchPublished,
+      batchBlocked,
+      batchFailed,
+      topReadiness: readinessValues.length ? Math.max(...readinessValues) : 0,
     }
     return {
       data,

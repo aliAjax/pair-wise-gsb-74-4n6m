@@ -4,7 +4,6 @@ import type {
   EventProperty,
   EventVersionSnapshot,
   GovernanceState,
-  ReleaseCandidate,
   SampleValidationResult,
   Severity,
   ValidationIssue,
@@ -327,25 +326,6 @@ export const validateSample = (
   })
 
   return { valid: errors.length === 0, errors, warnings }
-}
-
-export const releaseReadiness = (
-  release: ReleaseCandidate,
-  issues: ValidationIssue[],
-): number => {
-  const migrationTotal = release.migrationConfirmations.length
-  const migrationDone = release.migrationConfirmations.filter(
-    (item) => item.status === 'confirmed',
-  ).length
-  const approvalTotal = release.approvals.length
-  const approvalDone = release.approvals.filter((item) => item.status === 'approved').length
-  const issuePenalty = Math.min(
-    40,
-    issues.filter((issue) => release.eventIds.includes(issue.entityId)).length * 8,
-  )
-  const migrationScore = migrationTotal === 0 ? 40 : (migrationDone / migrationTotal) * 40
-  const approvalScore = approvalTotal === 0 ? 30 : (approvalDone / approvalTotal) * 30
-  return Math.max(0, Math.round(migrationScore + approvalScore + 30 - issuePenalty))
 }
 
 export const propertyReferences = (

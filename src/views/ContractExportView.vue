@@ -3,20 +3,51 @@ import { computed, ref, watch } from 'vue'
 import { CheckCircleIcon, DownloadIcon } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
+import BatchScopeBar from '@/components/BatchScopeBar.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import { platformLabel } from '@/services/batch'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
+
+const scopedBatch = computed(() =>
+  store.scope.platform
+    ? store.data.releases
+        .find((release) => release.id === store.scope.releaseId)
+        ?.batches.find((batch) => batch.platform === store.scope.platform) ?? null
+    : null,
+)
+const scopedEventIds = computed<string[] | null>(() => {
+  if (!store.scope.releaseId) return null
+  const release = store.data.releases.find((item) => item.id === store.scope.releaseId)
+  if (!release) return null
+  return scopedBatch.value ? scopedBatch.value.eventIds : release.eventIds
+})
+const scopedPlatform = computed(() => scopedBatch.value?.platform ?? null)
+
 const selectedEventIds = ref(
-  store.data.events
-    .filter((event) => ['approved', 'published', 'reviewing'].includes(event.status))
-    .map((event) => event.id),
+  (scopedEventIds.value ??
+    store.data.events
+      .filter((event) => ['approved', 'published', 'reviewing'].includes(event.status))
+      .map((event) => event.id)) as string[],
 )
 const format = ref<'json' | 'markdown'>('json')
 const includeDeprecated = ref(false)
 
+watch(
+  scopedEventIds,
+  (ids) => {
+    selectedEventIds.value = ids ? [...ids] : selectedEventIds.value
+  },
+  { immediate: false },
+)
+
 const eligibleEvents = computed(() =>
-  store.data.events.filter((event) => includeDeprecated.value || event.status !== 'retired'),
+  store.data.events.filter(
+    (event) =>
+      (includeDeprecated.value || event.status !== 'retired') &&
+      (!scopedEventIds.value || scopedEventIds.value.includes(event.id)),
+  ),
 )
 
 watch(includeDeprecated, () => {
@@ -27,8 +58,13 @@ watch(includeDeprecated, () => {
 
 const markdown = computed(() => {
   const events = store.data.events.filter((event) => selectedEventIds.value.includes(event.id))
+  const scopeTitle = scopedPlatform.value
+    ? `（${platformLabel(scopedPlatform.value)} 端批次）`
+    : scopedEventIds.value
+      ? '（发布候选范围）'
+      : ''
   return [
-    `# 埋点事件契约 ${store.data.currentVersion}`,
+    `# 埋点事件契约 ${store.data.currentVersion}${scopeTitle}`,
     '',
     ...events.flatMap((event) => [
       `## ${event.displayName} (\`${event.key}\`)`,
@@ -41,7 +77,11 @@ const markdown = computed(() => {
       '| 属性 | 类型 | 必填 | 枚举 | 说明 |',
       '| --- | --- | --- | --- | --- |',
       ...event.properties
-        .filter((property) => !property.deletedAt)
+        .filter(
+          (property) =>
+            !property.deletedAt &&
+            (!scopedPlatform.value || property.platforms.includes(scopedPlatform.value)),
+        )
         .map(
           (property) =>
             `| ${property.name} | ${property.type} | ${property.required ? '是' : '否'} | ${property.enumValues.join('/') || '-'} | ${property.description} |`,
@@ -49,17 +89,21 @@ const markdown = computed(() => {
       '',
       '**平台差异**',
       '',
-      ...event.platformRules.map(
-        (rule) =>
-          `- ${rule.platform}: ${rule.enabled ? rule.trigger : '已停用'}（${rule.owner}）`,
-      ),
+      ...event.platformRules
+        .filter((rule) => !scopedPlatform.value || rule.platform === scopedPlatform.value)
+        .map(
+          (rule) =>
+            `- ${rule.platform}: ${rule.enabled ? rule.trigger : '已停用'}（${rule.owner}）`,
+        ),
       '',
     ]),
   ].join('\n')
 })
 
 const output = computed(() =>
-  format.value === 'json' ? store.exportContract(selectedEventIds.value) : markdown.value,
+  format.value === 'json'
+    ? store.exportContract(selectedEventIds.value, scopedPlatform.value ?? undefined)
+    : markdown.value,
 )
 
 const download = async (): Promise<void> => {
@@ -76,10 +120,15 @@ const download = async (): Promise<void> => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `event-contract-${store.data.currentVersion}.${extension}`
+  const suffix = scopedPlatform.value ? `-${scopedPlatform.value}` : ''
+  anchor.download = `event-contract-${store.data.currentVersion}${suffix}.${extension}`
   anchor.click()
   URL.revokeObjectURL(url)
-  await MessagePlugin.success('契约文件已导出')
+  await MessagePlugin.success(
+    scopedPlatform.value
+      ? `${platformLabel(scopedPlatform.value)} 端批次契约已导出`
+      : '契约文件已导出',
+  )
 }
 
 const setExportSelection = (eventId: string, checked: unknown): void => {
@@ -94,14 +143,18 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
     <PageHeader
       eyebrow="交付物"
       title="契约导出"
-      description="选择事件和格式，生成可直接交付给客户端、数据与服务团队的事件契约文件。"
+      description="按所选端批次导出事件契约，生成可直接交付给对应客户端、数据与服务团队的 JSON 或 Markdown 文件。"
     />
+
+    <BatchScopeBar />
 
     <div class="export-layout">
       <aside class="panel export-options">
         <div class="panel-header">
           <h2 class="panel-title">导出范围</h2>
-          <span class="muted">{{ selectedEventIds.length }} 个事件</span>
+          <span class="muted">
+            {{ selectedEventIds.length }} 个事件{{ scopedBatch ? ` · ${platformLabel(scopedBatch.platform)} 端` : '' }}
+          </span>
         </div>
         <div class="format-options">
           <label>

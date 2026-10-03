@@ -4,8 +4,13 @@ import type {
   EventDefinition,
   EventVersionSnapshot,
   GovernanceState,
+  Platform,
+  PlatformBatch,
+  PublicationRecord,
   ReleaseCandidate,
 } from './domain'
+import { computePlatformBatchForBackfill, platformLabel } from '@/services/batch'
+import { createId } from '@/services/id'
 
 const events: EventDefinition[] = [
   {
@@ -779,7 +784,8 @@ const baselines: EventVersionSnapshot[] = [
   },
 ]
 
-const releases: ReleaseCandidate[] = [
+type SeedReleaseInput = Omit<ReleaseCandidate, 'batches'>
+const releases: SeedReleaseInput[] = [
   {
     id: 'rel-001',
     version: '2026.10.0',
@@ -942,6 +948,178 @@ const releases: ReleaseCandidate[] = [
   },
 ]
 
+const APPROVAL_ACTORS = { data: '顾清', product: '丁禾', client: '江驰', qa: '余安' } as const
+
+const batchHistory = (
+  action: PlatformBatch['history'][number]['action'],
+  detail: string,
+  at: string,
+): PlatformBatch['history'][number] => ({ id: createId('hist'), action, actor: '系统', detail, at })
+
+/** 已发布历史版本：按发布当时平台规则回填批次，并补登发布台账 */
+const buildPublishedBatches = (
+  release: SeedReleaseInput,
+): { batches: PlatformBatch[]; publications: PublicationRecord[] } => {
+  const batches: PlatformBatch[] = []
+  const publications: PublicationRecord[] = []
+  const publishedAt = release.publishedAt ?? release.createdAt
+  const platforms = Array.from(
+    new Set(
+      release.eventIds.flatMap((eventId) => {
+        const event = events.find((item) => item.id === eventId)
+        return event
+          ? event.platformRules.filter((rule) => rule.enabled).map((rule) => rule.platform)
+          : []
+      }),
+    ),
+  )
+  platforms.forEach((platform, index) => {
+    const payload = computePlatformBatchForBackfill(
+      { events, dependencies, baselines } as GovernanceState,
+      release,
+      platform,
+    )
+    if (payload.eventIds.length === 0) return
+    const batchId = createId('batch-seed')
+    batches.push({
+      id: batchId,
+      releaseId: release.id,
+      platform,
+      status: 'published',
+      ...payload,
+      migrationConfirmations: release.migrationConfirmations.map((confirmation) => ({
+        ...confirmation,
+        id: createId('mig-seed'),
+        status: 'confirmed',
+        confirmedAt: confirmation.confirmedAt ?? publishedAt,
+      })),
+      approvals: release.approvals.map((approval) => ({ ...approval, id: createId('appr-seed') })),
+      revision: 1,
+      publishedAt,
+      computedAt: release.createdAt,
+      history: [
+        batchHistory('created', `${platformLabel(platform)} 端按发布当时平台规则回填批次`, publishedAt),
+      ],
+    })
+    publications.push({
+      id: createId('pub-seed'),
+      releaseId: release.id,
+      batchId,
+      version: release.version,
+      platform,
+      attemptId: `seed-${release.id}-${platform}`,
+      eventIds: payload.eventIds,
+      operator: '历史发布人',
+      publishedAt: new Date(new Date(publishedAt).getTime() + index * 1000).toISOString(),
+    })
+  })
+  return { batches, publications }
+}
+
+interface ReviewingBatchTuning {
+  migrations: Record<string, 'pending' | 'confirmed'>
+  approvals: Array<'data' | 'product' | 'client' | 'qa'>
+  note: string
+}
+
+/** 评审候选：Web/iOS/Android/Server 各端独立门禁，Android 离线队列未切完 */
+const buildReviewingBatches = (release: SeedReleaseInput): PlatformBatch[] => {
+  const tuning: Record<Platform, ReviewingBatchTuning> = {
+    web: {
+      // Web 端迁移与审批齐备，可单独发布
+      migrations: { 'dep-001': 'confirmed', 'dep-004': 'confirmed' },
+      approvals: ['data', 'product', 'client', 'qa'],
+      note: 'Web 端契约与迁移已齐备，可独立发布，无需等待 Android 离线队列。',
+    },
+    ios: {
+      migrations: { 'dep-001': 'pending', 'dep-004': 'confirmed' },
+      approvals: ['data', 'qa'],
+      note: 'iOS 端等待交易转化看板确认迁移。',
+    },
+    android: {
+      // Android 离线队列没切完，迁移与客户端审批均未完成
+      migrations: { 'dep-001': 'pending', 'dep-004': 'pending' },
+      approvals: ['data'],
+      note: 'Android 端离线补报队列尚未切换完成，暂不满足发布门禁。',
+    },
+    server: {
+      migrations: { 'dep-001': 'confirmed' },
+      approvals: ['data', 'product'],
+      note: 'Server 端等待客户端与测试会签。',
+    },
+    miniprogram: {
+      migrations: {},
+      approvals: [],
+      note: '',
+    },
+  }
+
+  return (['web', 'ios', 'android', 'server'] as Platform[]).map((platform) => {
+    const payload = computePlatformBatchForBackfill(
+      { events, dependencies, baselines } as GovernanceState,
+      release,
+      platform,
+    )
+    const config = tuning[platform]
+    return {
+      id: createId('batch-seed'),
+      releaseId: release.id,
+      platform,
+      status: 'reviewing',
+      ...payload,
+      migrationConfirmations: payload.affectedDependencyIds.map((dependencyId) => {
+        const legacy = release.migrationConfirmations.find(
+          (item) => item.dependencyId === dependencyId,
+        )
+        const status = config.migrations[dependencyId] ?? 'pending'
+        return {
+          id: createId('mig-seed'),
+          dependencyId,
+          version: release.version,
+          status,
+          reviewer:
+            dependencies.find((dependency) => dependency.id === dependencyId)?.owner ??
+            legacy?.reviewer ??
+            '',
+          note:
+            status === 'confirmed'
+              ? `${platformLabel(platform)} 端迁移已验证兼容。`
+              : legacy?.note ?? '',
+          confirmedAt: status === 'confirmed' ? '2026-09-29T10:00:00+08:00' : undefined,
+        }
+      }),
+      approvals: (['data', 'product', 'client', 'qa'] as const).map((role) => {
+        const approved = config.approvals.includes(role)
+        return {
+          id: createId('appr-seed'),
+          role,
+          actor: APPROVAL_ACTORS[role],
+          status: approved ? ('approved' as const) : ('pending' as const),
+          comment: approved ? `${platformLabel(platform)} 端会签通过。` : '',
+          createdAt: approved ? '2026-09-29T11:00:00+08:00' : undefined,
+        }
+      }),
+      revision: 1,
+      computedAt: release.createdAt,
+      history: [batchHistory('created', config.note, release.createdAt)],
+    } satisfies PlatformBatch
+  })
+}
+
+const seedReleaseBatches = releases.map((release) => {
+  if (release.status === 'published') return buildPublishedBatches(release)
+  return { batches: buildReviewingBatches(release), publications: [] as PublicationRecord[] }
+})
+
+const releasesWithBatches: ReleaseCandidate[] = releases.map((release, index) => ({
+  ...release,
+  batches: seedReleaseBatches[index]!.batches,
+}))
+
+const seedPublications: PublicationRecord[] = seedReleaseBatches.flatMap(
+  (item) => item.publications,
+)
+
 const audit: AuditEvent[] = [
   {
     id: 'aud-001',
@@ -1023,7 +1201,7 @@ export const createSeedState = (): GovernanceState => ({
   ],
   dependencies,
   baselines,
-  releases,
+  releases: releasesWithBatches,
   deprecations: [
     {
       id: 'plan-001',
@@ -1041,6 +1219,7 @@ export const createSeedState = (): GovernanceState => ({
     {
       id: 'rollback-001',
       releaseId: 'rel-legacy-008',
+      platform: 'android',
       version: '2026.08.1',
       reason: 'Android 端 page_no 传参格式错误导致搜索报表异常。',
       operator: '江驰',
@@ -1050,6 +1229,9 @@ export const createSeedState = (): GovernanceState => ({
       evidence: 'RPT-INCIDENT-8821 / MOBILE-REL-2026-0819',
     },
   ],
+  publications: seedPublications,
   audit,
   currentVersion: '2026.10.0',
+  schemaVersion: 2,
+  simulateNextPublishFailure: false,
 })

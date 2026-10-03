@@ -3,19 +3,51 @@ import { computed, ref, watch } from 'vue'
 import { CheckCircleIcon, ErrorCircleIcon, SearchIcon } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
+import BatchScopeBar from '@/components/BatchScopeBar.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useValidationQuery } from '@/composables/useGovernanceQueries'
-import type { EventDefinition, SampleValidationResult } from '@/models/domain'
+import type { EventDefinition, Platform, SampleValidationResult } from '@/models/domain'
+import { platformLabel } from '@/services/batch'
 import { validateSample } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
 const validationQuery = useValidationQuery()
-const issues = computed(() => validationQuery.data.value ?? store.issues)
+const allIssues = computed(() => validationQuery.data.value ?? store.issues)
+
+const scopedBatch = computed(() =>
+  store.scope.platform
+    ? store.data.releases
+        .find((release) => release.id === store.scope.releaseId)
+        ?.batches.find((batch) => batch.platform === store.scope.platform) ?? null
+    : null,
+)
+const scopedEventIds = computed<string[] | null>(() => {
+  if (!store.scope.releaseId) return null
+  const release = store.data.releases.find((item) => item.id === store.scope.releaseId)
+  if (!release) return null
+  return scopedBatch.value ? scopedBatch.value.eventIds : release.eventIds
+})
+const scopedPlatform = computed<Platform | null>(() => scopedBatch.value?.platform ?? null)
+
+const issues = computed(() =>
+  scopedEventIds.value
+    ? allIssues.value.filter(
+        (issue) =>
+          scopedEventIds.value!.includes(issue.entityId) ||
+          scopedBatch.value?.affectedDependencyIds.includes(issue.entityId),
+      )
+    : allIssues.value,
+)
 
 const kindFilter = ref('')
 const severityFilter = ref('')
-const selectedEventId = ref(store.data.events[0]?.id ?? '')
+const scopedEvents = computed(() =>
+  scopedEventIds.value
+    ? store.data.events.filter((event) => scopedEventIds.value!.includes(event.id))
+    : store.data.events,
+)
+const selectedEventId = ref(scopedEvents.value[0]?.id ?? '')
 const sampleText = ref('')
 const validationResult = ref<SampleValidationResult | null>(null)
 
@@ -45,10 +77,19 @@ const selectedEvent = computed(
   () => store.data.events.find((event) => event.id === selectedEventId.value) ?? null,
 )
 
+watch(scopedEvents, (list) => {
+  if (list.length > 0 && !list.some((event) => event.id === selectedEventId.value)) {
+    selectedEventId.value = list[0]!.id
+  }
+})
+
 const sampleForEvent = (event: EventDefinition): string => {
   const payload: Record<string, unknown> = {}
   event.properties
-    .filter((property) => !property.deletedAt)
+    .filter(
+      (property) =>
+        !property.deletedAt && (!scopedPlatform.value || property.platforms.includes(scopedPlatform.value)),
+    )
     .forEach((property) => {
       if (!property.required && property.name === 'coupon_id') return
       switch (property.type) {
@@ -110,8 +151,10 @@ const runValidation = async (): Promise<void> => {
     <PageHeader
       eyebrow="规则引擎"
       title="契约校验与示例检查"
-      description="检查重复事件、同义属性、命名越界、类型变化和删除字段引用，并用 JSON 示例验证单事件契约。"
+      description="问题与 JSON 示例按所选端批次展示；检查重复事件、同义属性、命名越界、类型变化、删除字段引用及示例规则。"
     />
+
+    <BatchScopeBar />
 
     <section class="panel filter-panel">
       <div class="toolbar-row">
@@ -140,7 +183,12 @@ const runValidation = async (): Promise<void> => {
     <div class="validation-layout">
       <section class="panel">
         <div class="panel-header">
-          <h2 class="panel-title">治理问题 {{ filteredIssues.length }} 项</h2>
+          <h2 class="panel-title">
+            治理问题 {{ filteredIssues.length }} 项
+            <t-tag v-if="scopedBatch" theme="primary" variant="light" size="small" class="scope-tag">
+              {{ platformLabel(scopedBatch.platform) }} 端批次
+            </t-tag>
+          </h2>
         </div>
         <div class="validation-list issue-list">
           <article
@@ -178,7 +226,7 @@ const runValidation = async (): Promise<void> => {
             <t-select
               v-model="selectedEventId"
               :options="
-                store.data.events.map((event) => ({
+                scopedEvents.map((event) => ({
                   label: `${event.displayName} (${event.key})`,
                   value: event.id,
                 }))
@@ -219,6 +267,10 @@ const runValidation = async (): Promise<void> => {
 <style scoped>
 .filter-panel {
   padding: 14px 16px;
+}
+
+.scope-tag {
+  margin-left: 8px;
 }
 
 .validation-layout {

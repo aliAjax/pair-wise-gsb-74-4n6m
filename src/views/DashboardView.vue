@@ -12,7 +12,7 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useDashboardQuery, useValidationQuery } from '@/composables/useGovernanceQueries'
-import { releaseReadiness } from '@/services/selectors'
+import { batchReadiness, platformLabel } from '@/services/batch'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -22,16 +22,23 @@ const validationQuery = useValidationQuery()
 const dashboard = computed(() => dashboardQuery.data.value)
 const issues = computed(() => validationQuery.data.value ?? store.issues)
 const currentRelease = computed(() => dashboard.value?.currentRelease ?? null)
+const activeBatches = computed(() =>
+  (currentRelease.value?.batches ?? []).filter((batch) => batch.status !== 'rolled_back'),
+)
+const bestBatch = computed(() =>
+  [...activeBatches.value].sort(
+    (left, right) => batchReadiness(right, issues.value) - batchReadiness(left, issues.value),
+  )[0],
+)
 const readiness = computed(() =>
-  currentRelease.value ? releaseReadiness(currentRelease.value, issues.value) : 0,
+  bestBatch.value ? batchReadiness(bestBatch.value, issues.value) : 0,
 )
 
-const pendingMigrations = computed(
-  () =>
-    currentRelease.value?.migrationConfirmations.filter((item) => item.status !== 'confirmed') ?? [],
+const pendingBatches = computed(
+  () => activeBatches.value.filter((batch) => batch.status !== 'published'),
 )
-const pendingApprovals = computed(
-  () => currentRelease.value?.approvals.filter((item) => item.status === 'pending') ?? [],
+const failedBatches = computed(
+  () => activeBatches.value.filter((batch) => batch.status === 'publish_failed'),
 )
 </script>
 
@@ -40,7 +47,7 @@ const pendingApprovals = computed(
     <PageHeader
       eyebrow="数据契约治理"
       title="事件治理工作台"
-      description="聚合多端事件契约、校验问题、下游迁移与发布评审状态。"
+      description="聚合多端事件契约、按端批次发布门禁、校验问题与下游迁移状态。"
     />
 
     <section v-if="dashboardQuery.isError.value" class="load-error">
@@ -54,9 +61,11 @@ const pendingApprovals = computed(
         <div class="metric-note">{{ dashboard?.draftEventCount ?? 0 }} 个草稿或评审中</div>
       </div>
       <div class="metric">
-        <div class="metric-label">下游依赖</div>
-        <div class="metric-value">{{ dashboard?.dependencyCount ?? store.data.dependencies.length }}</div>
-        <div class="metric-note">{{ dashboard?.pendingMigrations ?? 0 }} 个待迁移确认</div>
+        <div class="metric-label">待推进端批次</div>
+        <div class="metric-value">{{ dashboard?.batchBlocked ?? pendingBatches.length }}</div>
+        <div class="metric-note">
+          {{ dashboard?.batchPublished ?? 0 }}/{{ dashboard?.batchTotal ?? activeBatches.length }} 端已发布
+        </div>
       </div>
       <div class="metric">
         <div class="metric-label">契约问题</div>
@@ -66,10 +75,17 @@ const pendingApprovals = computed(
         <div class="metric-note">{{ dashboard?.criticalIssueCount ?? 0 }} 个严重问题</div>
       </div>
       <div class="metric">
-        <div class="metric-label">发布就绪度</div>
+        <div class="metric-label">最就绪端批次</div>
         <div class="metric-value">{{ readiness }}%</div>
-        <div class="metric-note">{{ currentRelease?.version ?? '暂无评审版本' }}</div>
+        <div class="metric-note">
+          {{ bestBatch ? `${platformLabel(bestBatch.platform)} · ${currentRelease?.version ?? ''}` : '暂无评审端批次' }}
+        </div>
       </div>
+    </div>
+
+    <div v-if="failedBatches.length" class="metric-note failure-note">
+      <ErrorCircleIcon />
+      {{ failedBatches.length }} 个端批次写入失败停留在未完成态，可在发布评审页用同一 attemptId 重试，不会重复生成发布记录。
     </div>
 
     <div class="dashboard-grid">
@@ -85,64 +101,46 @@ const pendingApprovals = computed(
               <strong>{{ currentRelease.version }}</strong>
             </div>
             <div>
-              <span>事件</span>
-              <strong>{{ currentRelease.eventIds.length }}</strong>
+              <span>端批次</span>
+              <strong>{{ currentRelease.batches.length }}</strong>
             </div>
             <div>
-              <span>下游依赖</span>
+              <span>已发布端</span>
+              <strong>
+                {{ currentRelease.batches.filter((batch) => batch.status === 'published').length }}
+              </strong>
+            </div>
+            <div>
+              <span>受影响下游</span>
               <strong>{{ currentRelease.affectedDependencyIds.length }}</strong>
             </div>
-            <div>
-              <span>契约差异</span>
-              <strong>{{ currentRelease.differences.length }}</strong>
-            </div>
           </div>
-          <div class="release-progress">
-            <div class="progress-head">
-              <span>迁移确认</span>
-              <strong>
-                {{ currentRelease.migrationConfirmations.length - pendingMigrations.length }}/{{
-                  currentRelease.migrationConfirmations.length
+          <div class="batch-progress-list">
+            <div v-for="batch in currentRelease.batches" :key="batch.id" class="batch-progress">
+              <div class="progress-head">
+                <span>{{ platformLabel(batch.platform) }} 端</span>
+                <StatusTag :value="batch.status" />
+                <strong>{{ batchReadiness(batch, issues) }}%</strong>
+              </div>
+              <t-progress
+                :percentage="batchReadiness(batch, issues)"
+                :label="false"
+                :status="batch.status === 'published' || batchReadiness(batch, issues) >= 90 ? 'success' : 'warning'"
+              />
+              <small>
+                迁移
+                {{ batch.migrationConfirmations.filter((m) => m.status === 'confirmed').length }}/{{
+                  batch.migrationConfirmations.length
                 }}
-              </strong>
-            </div>
-            <t-progress
-              :percentage="
-                currentRelease.migrationConfirmations.length
-                  ? Math.round(
-                      ((currentRelease.migrationConfirmations.length - pendingMigrations.length) /
-                        currentRelease.migrationConfirmations.length) *
-                        100,
-                    )
-                  : 100
-              "
-              :label="false"
-            />
-          </div>
-          <div class="release-progress">
-            <div class="progress-head">
-              <span>批量审批</span>
-              <strong>
-                {{ currentRelease.approvals.length - pendingApprovals.length }}/{{
-                  currentRelease.approvals.length
+                · 审批
+                {{ batch.approvals.filter((a) => a.status === 'approved').length }}/{{
+                  batch.approvals.length
                 }}
-              </strong>
+              </small>
             </div>
-            <t-progress
-              :percentage="
-                currentRelease.approvals.length
-                  ? Math.round(
-                      ((currentRelease.approvals.length - pendingApprovals.length) /
-                        currentRelease.approvals.length) *
-                        100,
-                    )
-                  : 100
-              "
-              :label="false"
-            />
           </div>
           <RouterLink to="/releases" class="release-link">
-            进入发布评审
+            进入按端发布评审
             <ChevronRightIcon />
           </RouterLink>
         </template>
@@ -160,15 +158,18 @@ const pendingApprovals = computed(
           <div class="health-row">
             <span class="health-icon success"><CheckCircleIcon /></span>
             <div>
-              <strong>已发布或已通过事件</strong>
-              <span>{{ dashboard?.activeEventCount ?? 0 }} 个</span>
+              <strong>已发布端批次</strong>
+              <span>{{ dashboard?.batchPublished ?? 0 }} 个端已独立发布</span>
             </div>
           </div>
           <div class="health-row">
             <span class="health-icon warning"><ErrorCircleIcon /></span>
             <div>
-              <strong>待确认迁移</strong>
-              <span>{{ pendingMigrations.length }} 个下游依赖</span>
+              <strong>待推进 / 写入失败端批次</strong>
+              <span>
+                {{ dashboard?.batchBlocked ?? pendingBatches.length }} 个待推进 ·
+                {{ dashboard?.batchFailed ?? failedBatches.length }} 个写入失败
+              </span>
             </div>
           </div>
           <div class="health-row">
@@ -225,6 +226,17 @@ const pendingApprovals = computed(
   gap: 16px;
 }
 
+.failure-note {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid #f2b8b5;
+  border-radius: 7px;
+  color: #a81f17;
+  background: #fff7f6;
+}
+
 .release-summary {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -249,14 +261,32 @@ const pendingApprovals = computed(
   font-size: 18px;
 }
 
-.release-progress {
+.batch-progress-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
   padding: 16px 18px 0;
+}
+
+.batch-progress {
+  display: grid;
+  gap: 6px;
+  padding: 12px;
+  border: 1px solid #e8ebef;
+  border-radius: 6px;
+  background: #fafbfc;
 }
 
 .progress-head {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+  gap: 8px;
+}
+
+.batch-progress small {
+  color: #7a8494;
+  font-size: 10px;
 }
 
 .release-link {

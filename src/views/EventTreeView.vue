@@ -19,7 +19,9 @@ import type {
   Platform,
   PlatformRule,
   PropertyType,
+  ReleaseBatch,
 } from '@/models/domain'
+import { ALL_PLATFORMS, PLATFORM_LABELS } from '@/models/domain'
 import { createId } from '@/services/repository'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -40,6 +42,27 @@ const selectedId = ref(store.data.events[0]?.id ?? '')
 const selectedEvent = computed(
   () => store.data.events.find((event) => event.id === selectedId.value) ?? null,
 )
+
+/** 当前事件在各端的最新批次（含历史回填批次） */
+const eventBatches = computed(() => {
+  const eventId = selectedId.value
+  const allBatches: ReleaseBatch[] = store.data.releases.flatMap(
+    (release) => release.batches ?? [],
+  )
+  return ALL_PLATFORMS.map((platform) => {
+    const rule = selectedEvent.value?.platformRules.find((item) => item.platform === platform)
+    const candidates = allBatches
+      .filter((batch) => batch.platform === platform && batch.eventIds.includes(eventId))
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime())
+    return {
+      platform,
+      key: platform,
+      label: PLATFORM_LABELS[platform],
+      enabled: Boolean(rule?.enabled),
+      batch: candidates[0] ?? null,
+    }
+  })
+})
 const eventEditorVisible = ref(false)
 const propertyEditorVisible = ref(false)
 const platformEditorVisible = ref(false)
@@ -499,6 +522,45 @@ const setPlatform = (value: unknown): void => {
             </template>
           </t-table>
         </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2 class="panel-title">各端发布批次</h2>
+            <span class="muted">事件或规则变更后只重算受影响端</span>
+          </div>
+          <div class="platform-batch-grid">
+            <div
+              v-for="item in eventBatches"
+              :key="item.key"
+              class="platform-batch-card"
+              :class="{ dirty: item.batch?.dirty, none: !item.batch }"
+            >
+              <div class="batch-card-head">
+                <strong>{{ item.label }}</strong>
+                <StatusTag v-if="item.batch" :value="item.batch.status" />
+                <span v-else class="muted">无批次</span>
+              </div>
+              <p v-if="!item.enabled" class="muted">该端未启用采集</p>
+              <template v-else-if="item.batch">
+                <span v-if="item.batch.backfilled" class="backfilled-tag">历史数据兼容回填</span>
+                <span v-if="item.batch.dirty" class="dirty-tag">契约已变更，待重算</span>
+                <span v-else-if="item.batch.status === 'published'" class="muted">
+                  已于 {{ new Date(item.batch.publishedAt ?? '').toLocaleDateString('zh-CN') }} 发布
+                </span>
+                <span v-else class="muted">
+                  迁移
+                  {{
+                    item.batch.migrationConfirmations.filter((c) => c.status === 'confirmed').length
+                  }}/{{ item.batch.migrationConfirmations.length }} · 审批
+                  {{ item.batch.approvals.filter((a) => a.status === 'approved').length }}/{{
+                    item.batch.approvals.length
+                  }}
+                </span>
+              </template>
+              <p v-else class="muted">该端当前没有进行中的发布批次</p>
+            </div>
+          </div>
+        </section>
       </section>
       <div v-else class="panel empty-state">从左侧选择一个事件查看契约。</div>
     </div>
@@ -779,6 +841,50 @@ const setPlatform = (value: unknown): void => {
   min-height: 32px;
   display: flex;
   align-items: center;
+}
+
+.platform-batch-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+  gap: 10px;
+  padding: 16px;
+}
+
+.platform-batch-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e4e8ee;
+  border-radius: 6px;
+  background: #fbfcfe;
+}
+
+.platform-batch-card.dirty {
+  border-color: #e7b75f;
+  background: #fff9ef;
+}
+
+.platform-batch-card.none {
+  opacity: 0.7;
+}
+
+.batch-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.dirty-tag {
+  color: #b65300;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.backfilled-tag {
+  color: #1264c5;
+  font-size: 11px;
+  font-weight: 600;
 }
 
 .dialog-footer {

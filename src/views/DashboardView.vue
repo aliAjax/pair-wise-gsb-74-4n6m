@@ -12,7 +12,8 @@ import {
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useDashboardQuery, useValidationQuery } from '@/composables/useGovernanceQueries'
-import { releaseReadiness } from '@/services/selectors'
+import { PLATFORM_LABELS } from '@/models/domain'
+import { batchReadiness } from '@/services/batches'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -22,16 +23,26 @@ const validationQuery = useValidationQuery()
 const dashboard = computed(() => dashboardQuery.data.value)
 const issues = computed(() => validationQuery.data.value ?? store.issues)
 const currentRelease = computed(() => dashboard.value?.currentRelease ?? null)
-const readiness = computed(() =>
-  currentRelease.value ? releaseReadiness(currentRelease.value, issues.value) : 0,
-)
 
-const pendingMigrations = computed(
-  () =>
-    currentRelease.value?.migrationConfirmations.filter((item) => item.status !== 'confirmed') ?? [],
+/** 当前候选各端批次概览（按端批次展示） */
+const currentBatches = computed(() => currentRelease.value?.batches ?? [])
+
+const readinessOf = (batch: (typeof currentBatches.value)[number]): number =>
+  batchReadiness(batch, issues.value)
+
+const pendingMigrations = computed(() =>
+  currentBatches.value.reduce(
+    (count, batch) =>
+      count + batch.migrationConfirmations.filter((item) => item.status !== 'confirmed').length,
+    0,
+  ),
 )
-const pendingApprovals = computed(
-  () => currentRelease.value?.approvals.filter((item) => item.status === 'pending') ?? [],
+const pendingApprovals = computed(() =>
+  currentBatches.value.reduce(
+    (count, batch) =>
+      count + batch.approvals.filter((item) => item.status === 'pending').length,
+    0,
+  ),
 )
 </script>
 
@@ -40,7 +51,7 @@ const pendingApprovals = computed(
     <PageHeader
       eyebrow="数据契约治理"
       title="事件治理工作台"
-      description="聚合多端事件契约、校验问题、下游迁移与发布评审状态。"
+      description="发布候选按端推进：迁移、审批、发布与回滚均以端批次为单位，某端变更不牵连其他稳定端。"
     />
 
     <section v-if="dashboardQuery.isError.value" class="load-error">
@@ -56,7 +67,7 @@ const pendingApprovals = computed(
       <div class="metric">
         <div class="metric-label">下游依赖</div>
         <div class="metric-value">{{ dashboard?.dependencyCount ?? store.data.dependencies.length }}</div>
-        <div class="metric-note">{{ dashboard?.pendingMigrations ?? 0 }} 个待迁移确认</div>
+        <div class="metric-note">{{ pendingMigrations }} 个端批次待迁移确认</div>
       </div>
       <div class="metric">
         <div class="metric-label">契约问题</div>
@@ -66,8 +77,12 @@ const pendingApprovals = computed(
         <div class="metric-note">{{ dashboard?.criticalIssueCount ?? 0 }} 个严重问题</div>
       </div>
       <div class="metric">
-        <div class="metric-label">发布就绪度</div>
-        <div class="metric-value">{{ readiness }}%</div>
+        <div class="metric-label">端批次发布</div>
+        <div class="metric-value">
+          {{ currentBatches.filter((batch) => batch.status === 'published').length }}/{{
+            currentBatches.length
+          }}
+        </div>
         <div class="metric-note">{{ currentRelease?.version ?? '暂无评审版本' }}</div>
       </div>
     </div>
@@ -85,64 +100,46 @@ const pendingApprovals = computed(
               <strong>{{ currentRelease.version }}</strong>
             </div>
             <div>
-              <span>事件</span>
-              <strong>{{ currentRelease.eventIds.length }}</strong>
+              <span>端批次</span>
+              <strong>{{ currentBatches.length }}</strong>
             </div>
             <div>
-              <span>下游依赖</span>
-              <strong>{{ currentRelease.affectedDependencyIds.length }}</strong>
+              <span>待迁移</span>
+              <strong>{{ pendingMigrations }}</strong>
             </div>
             <div>
-              <span>契约差异</span>
-              <strong>{{ currentRelease.differences.length }}</strong>
+              <span>待审批</span>
+              <strong>{{ pendingApprovals }}</strong>
             </div>
           </div>
-          <div class="release-progress">
-            <div class="progress-head">
-              <span>迁移确认</span>
-              <strong>
-                {{ currentRelease.migrationConfirmations.length - pendingMigrations.length }}/{{
-                  currentRelease.migrationConfirmations.length
+
+          <div class="batch-progress-list">
+            <div v-for="batch in currentBatches" :key="batch.id" class="batch-progress">
+              <div class="progress-head">
+                <span>
+                  <strong>{{ PLATFORM_LABELS[batch.platform] }}</strong>
+                  <span v-if="batch.backfilled" class="backfilled-note">历史回填</span>
+                  <span v-if="batch.dirty" class="dirty-note">待重算</span>
+                  <span v-if="batch.writeState === 'failed'" class="failed-note">写入失败</span>
+                </span>
+                <span class="batch-side">
+                  <StatusTag :value="batch.status" />
+                  <strong>{{ readinessOf(batch) }}%</strong>
+                </span>
+              </div>
+              <t-progress :percentage="readinessOf(batch)" :label="false" />
+              <div class="batch-sub">
+                迁移
+                {{ batch.migrationConfirmations.filter((item) => item.status === 'confirmed').length
+                }}/{{ batch.migrationConfirmations.length }} · 审批
+                {{ batch.approvals.filter((item) => item.status === 'approved').length }}/{{
+                  batch.approvals.length
                 }}
-              </strong>
+              </div>
             </div>
-            <t-progress
-              :percentage="
-                currentRelease.migrationConfirmations.length
-                  ? Math.round(
-                      ((currentRelease.migrationConfirmations.length - pendingMigrations.length) /
-                        currentRelease.migrationConfirmations.length) *
-                        100,
-                    )
-                  : 100
-              "
-              :label="false"
-            />
-          </div>
-          <div class="release-progress">
-            <div class="progress-head">
-              <span>批量审批</span>
-              <strong>
-                {{ currentRelease.approvals.length - pendingApprovals.length }}/{{
-                  currentRelease.approvals.length
-                }}
-              </strong>
-            </div>
-            <t-progress
-              :percentage="
-                currentRelease.approvals.length
-                  ? Math.round(
-                      ((currentRelease.approvals.length - pendingApprovals.length) /
-                        currentRelease.approvals.length) *
-                        100,
-                    )
-                  : 100
-              "
-              :label="false"
-            />
           </div>
           <RouterLink to="/releases" class="release-link">
-            进入发布评审
+            进入按端发布评审
             <ChevronRightIcon />
           </RouterLink>
         </template>
@@ -167,8 +164,8 @@ const pendingApprovals = computed(
           <div class="health-row">
             <span class="health-icon warning"><ErrorCircleIcon /></span>
             <div>
-              <strong>待确认迁移</strong>
-              <span>{{ pendingMigrations.length }} 个下游依赖</span>
+              <strong>端批次待确认迁移</strong>
+              <span>{{ pendingMigrations }} 个迁移确认跨端分布</span>
             </div>
           </div>
           <div class="health-row">
@@ -191,14 +188,18 @@ const pendingApprovals = computed(
 
     <section class="panel">
       <div class="panel-header">
-        <h2 class="panel-title">优先校验项</h2>
+        <h2 class="panel-title">优先校验项（可按端在契约校验页过滤）</h2>
         <RouterLink to="/validation" class="text-link">查看全部</RouterLink>
       </div>
       <div class="issue-grid">
         <article v-for="issue in issues.slice(0, 6)" :key="issue.id" class="issue-card">
           <div>
+            <span class="issue-platforms">
+              <i v-for="platform in issue.platforms ?? []" :key="platform">{{
+                PLATFORM_LABELS[platform]
+              }}</i>
+            </span>
             <StatusTag :value="issue.severity" />
-            <span>{{ issue.kind }}</span>
           </div>
           <strong>{{ issue.title }}</strong>
           <p>{{ issue.detail }}</p>
@@ -249,14 +250,65 @@ const pendingApprovals = computed(
   font-size: 18px;
 }
 
-.release-progress {
+.batch-progress-list {
+  display: grid;
+  gap: 14px;
   padding: 16px 18px 0;
+}
+
+.batch-progress {
+  display: grid;
+  gap: 6px;
 }
 
 .progress-head {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  margin-bottom: 8px;
+}
+
+.progress-head > span:first-child {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-side {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.batch-side strong {
+  font-size: 13px;
+}
+
+.batch-sub {
+  color: #8a93a3;
+  font-size: 10px;
+}
+
+.backfilled-note,
+.dirty-note,
+.failed-note {
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 10px;
+}
+
+.backfilled-note {
+  color: #1264c5;
+  background: #e8f1fd;
+}
+
+.dirty-note {
+  color: #b65300;
+  background: #fdf3e3;
+}
+
+.failed-note {
+  color: #c7362c;
+  background: #fdeceb;
 }
 
 .release-link {
@@ -343,10 +395,18 @@ const pendingApprovals = computed(
   justify-content: space-between;
 }
 
-.issue-card > div span {
-  color: #8891a0;
+.issue-platforms {
+  display: flex;
+  gap: 4px;
+}
+
+.issue-platforms i {
+  padding: 0 6px;
+  border-radius: 3px;
+  color: #1264c5;
+  background: #e8f1fd;
   font-size: 10px;
-  text-transform: uppercase;
+  font-style: normal;
 }
 
 .issue-card p {

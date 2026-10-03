@@ -10,18 +10,29 @@ import PageHeader from '@/components/PageHeader.vue'
 import PropertyLineageGraph from '@/components/PropertyLineageGraph.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useLineageQuery } from '@/composables/useGovernanceQueries'
+import { ALL_PLATFORMS, PLATFORM_LABELS, type Platform } from '@/models/domain'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
 const lineageQuery = useLineageQuery()
+
+const platformFilter = ref<Platform | ''>('')
+const platformOptions = ALL_PLATFORMS.map((platform) => ({
+  label: PLATFORM_LABELS[platform],
+  value: platform,
+}))
 
 const selectedEventId = ref(store.data.events[0]?.id ?? '')
 const selectedPropertyId = ref(store.data.events[0]?.properties[0]?.id ?? '')
 const events = computed(() => lineageQuery.data.value?.events ?? store.data.events)
 const dependencies = computed(() => lineageQuery.data.value?.dependencies ?? store.data.dependencies)
 const selectedEvent = computed(() => events.value.find((event) => event.id === selectedEventId.value))
-const properties = computed(
-  () => selectedEvent.value?.properties.filter((property) => !property.deletedAt) ?? [],
+const properties = computed(() =>
+  (selectedEvent.value?.properties ?? []).filter(
+    (property) =>
+      !property.deletedAt &&
+      (!platformFilter.value || property.platforms.includes(platformFilter.value as Platform)),
+  ),
 )
 const selectedProperty = computed(
   () => properties.value.find((property) => property.id === selectedPropertyId.value) ?? null,
@@ -33,8 +44,33 @@ const sourceProperty = computed(() =>
         .find((item) => item.property.id === selectedProperty.value?.lineageSourceId)
     : null,
 )
+/** 按端批次视角：属性、来源与下游均只看该端 */
+const lineageEvents = computed(() => {
+  if (!platformFilter.value) return events.value
+  const platform = platformFilter.value
+  return events.value.map((event) => ({
+    ...event,
+    properties: event.properties.filter(
+      (property) => !property.deletedAt && property.platforms.includes(platform),
+    ),
+  }))
+})
+const lineageDependencies = computed(() => {
+  if (!platformFilter.value) return dependencies.value
+  const platform = platformFilter.value
+  return dependencies.value
+    .map((dependency) => ({
+      ...dependency,
+      propertyRefs: dependency.propertyRefs.filter((reference) => {
+        const event = events.value.find((item) => item.id === reference.eventId)
+        const property = event?.properties.find((item) => item.id === reference.propertyId)
+        return Boolean(property && property.platforms.includes(platform))
+      }),
+    }))
+    .filter((dependency) => dependency.propertyRefs.length > 0)
+})
 const relatedDependencies = computed(() =>
-  dependencies.value.filter((dependency) =>
+  lineageDependencies.value.filter((dependency) =>
     dependency.propertyRefs.some(
       (reference) =>
         reference.propertyId === selectedPropertyId.value ||
@@ -43,7 +79,7 @@ const relatedDependencies = computed(() =>
   ),
 )
 
-watch(selectedEventId, () => {
+watch([selectedEventId, platformFilter], () => {
   selectedPropertyId.value = properties.value[0]?.id ?? ''
 })
 
@@ -61,6 +97,15 @@ const statusOf = (status: string): string =>
 
     <section class="panel lineage-controls">
       <div class="toolbar-row">
+        <div class="toolbar-field">
+          <span>端批次</span>
+          <t-select
+            v-model="platformFilter"
+            :options="platformOptions"
+            placeholder="全部端"
+            clearable
+          />
+        </div>
         <div class="toolbar-field event-field">
           <span>事件</span>
           <t-select
@@ -117,8 +162,8 @@ const statusOf = (status: string): string =>
         <span class="muted">选取属性后自动展开跨事件继承及下游引用</span>
       </div>
       <PropertyLineageGraph
-        :events="events"
-        :dependencies="dependencies"
+        :events="lineageEvents"
+        :dependencies="lineageDependencies"
         :selected-property-id="selectedPropertyId"
       />
     </section>
@@ -141,12 +186,12 @@ const statusOf = (status: string): string =>
             <strong>{{ dependency.type }}</strong>
           </div>
           <div class="dependency-meta">
-            <span>引用属性</span>
+            <span>引用属性{{ platformFilter ? `（${PLATFORM_LABELS[platformFilter as Platform]} 端）` : ''}}</span>
             <strong>
               {{
                 dependency.propertyRefs
                   .map((reference) => {
-                    const event = events.find((item) => item.id === reference.eventId)
+                    const event = lineageEvents.find((item) => item.id === reference.eventId)
                     const property = event?.properties.find((item) => item.id === reference.propertyId)
                     return `${event?.key ?? reference.eventId}.${property?.name ?? reference.propertyId}`
                   })

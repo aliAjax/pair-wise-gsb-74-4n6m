@@ -8,7 +8,7 @@ import {
   UserIcon,
 } from 'tdesign-icons-vue-next'
 import StatusTag from '@/components/StatusTag.vue'
-import type { EventDefinition } from '@/models/domain'
+import { PLATFORM_LABELS, type EventDefinition } from '@/models/domain'
 
 const props = defineProps<{
   events: EventDefinition[]
@@ -65,6 +65,16 @@ const toggle = (category: string): void => {
           <span class="event-label">
             <strong>{{ event.displayName }}</strong>
             <code>{{ event.key }}</code>
+            <span class="event-platforms">
+              <i
+                v-for="rule in event.platformRules.filter((item) => item.enabled)"
+                :key="rule.id"
+                class="platform-chip"
+                :class="`chip-${rule.platform}`"
+              >
+                {{ PLATFORM_LABELS[rule.platform] }}
+              </i>
+            </span>
           </span>
           <StatusTag :value="event.status" />
         </button>
@@ -155,6 +165,47 @@ const toggle = (category: string): void => {
   font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.event-platforms {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+}
+
+.platform-chip {
+  padding: 0 5px;
+  border-radius: 3px;
+  font-style: normal;
+  font-size: 9px;
+  line-height: 15px;
+  color: #4a5568;
+  background: #eef1f5;
+}
+
+.chip-web {
+  color: #1264c5;
+  background: #e8f1fd;
+}
+
+.chip-ios {
+  color: #5b3aa0;
+  background: #f0eafd;
+}
+
+.chip-android {
+  color: #0f8a62;
+  background: #e6f7f0;
+}
+
+.chip-server {
+  color: #a45a00;
+  background: #fdf3e3;
+}
+
+.chip-miniprogram {
+  color: #b42318;
+  background: #fdeceb;
 }
 
 .tree-footer {

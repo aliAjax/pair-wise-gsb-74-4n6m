@@ -4,11 +4,22 @@ import type {
   EventProperty,
   EventVersionSnapshot,
   GovernanceState,
-  ReleaseCandidate,
+  Platform,
   SampleValidationResult,
   Severity,
   ValidationIssue,
 } from '@/models/domain'
+
+/** 事件实际启用采集的端 */
+export const eventActivePlatforms = (event: EventDefinition): Platform[] =>
+  event.platformRules.filter((rule) => rule.enabled).map((rule) => rule.platform)
+
+/** 属性的端归属：取属性声明平台与事件启用端的交集，缺省按事件全部启用端 */
+export const propertyPlatforms = (event: EventDefinition, property: EventProperty): Platform[] => {
+  const active = eventActivePlatforms(event)
+  const intersection = property.platforms.filter((platform) => active.includes(platform))
+  return intersection.length > 0 ? intersection : active
+}
 
 const NAMING_PATTERN = /^[a-z][a-z0-9_]{2,31}$/
 const normalize = (value: string): string =>
@@ -49,20 +60,24 @@ export const compareEventContract = (
   const requiredChanges: string[] = []
   const typeChanges: string[] = []
   const enumChanges: string[] = []
+  const changedPropertyIds = new Set<string>()
 
   after.forEach((property) => {
     const previous = beforeMap.get(property.id)
     if (!previous) {
       addedProperties.push(property.name)
+      changedPropertyIds.add(property.id)
       return
     }
     if (previous.required !== property.required) {
       requiredChanges.push(
         `${property.name}: ${previous.required ? '必填' : '选填'} → ${property.required ? '必填' : '选填'}`,
       )
+      changedPropertyIds.add(property.id)
     }
     if (previous.type !== property.type) {
       typeChanges.push(`${property.name}: ${previous.type} → ${property.type}`)
+      changedPropertyIds.add(property.id)
     }
     if (previous.enumValues.join('|') !== property.enumValues.join('|')) {
       const added = property.enumValues.filter((value) => !previous.enumValues.includes(value))
@@ -70,11 +85,15 @@ export const compareEventContract = (
       enumChanges.push(
         `${property.name}: ${added.length ? `新增 ${added.join('/')}` : ''}${added.length && removed.length ? '；' : ''}${removed.length ? `移除 ${removed.join('/')}` : ''}`,
       )
+      changedPropertyIds.add(property.id)
     }
   })
 
   before.forEach((property) => {
-    if (!afterMap.has(property.id)) removedProperties.push(property.name)
+    if (!afterMap.has(property.id)) {
+      removedProperties.push(property.name)
+      changedPropertyIds.add(property.id)
+    }
   })
 
   return {
@@ -85,6 +104,7 @@ export const compareEventContract = (
     requiredChanges,
     typeChanges,
     enumChanges,
+    changedPropertyIds: [...changedPropertyIds],
   }
 }
 
@@ -104,8 +124,10 @@ export const affectedDependencies = (
   state: GovernanceState,
   differences: ContractDifference[],
 ): string[] => {
+  const changedPropertyIds = new Set<string>()
   const changedPropertyNames = new Set<string>()
   differences.forEach((difference) => {
+    difference.changedPropertyIds?.forEach((id) => changedPropertyIds.add(id))
     ;[
       ...difference.addedProperties,
       ...difference.removedProperties,
@@ -120,6 +142,7 @@ export const affectedDependencies = (
   return state.dependencies
     .filter((dependency) =>
       dependency.propertyRefs.some((reference) => {
+        if (changedPropertyIds.has(reference.propertyId)) return true
         const event = state.events.find((item) => item.id === reference.eventId)
         const property = event?.properties.find((item) => item.id === reference.propertyId)
         return Boolean(property && changedPropertyNames.has(property.name))
@@ -149,6 +172,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
           detail: `两个事件同属“${left.category}”，名称或语义相似度较高。`,
           entityId: right.id,
           suggestion: '确认是否合并事件，或补充清晰的业务边界说明。',
+          platforms: [...new Set([...eventActivePlatforms(left), ...eventActivePlatforms(right)])],
         })
       }
     }
@@ -167,6 +191,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
             detail: '属性名必须为 3 至 32 位小写 snake_case，并以字母开头。',
             entityId: event.id,
             suggestion: `建议调整为 ${normalize(property.name).slice(0, 32)}。`,
+            platforms: propertyPlatforms(event, property),
           })
         }
       })
@@ -179,6 +204,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
         detail: '事件名必须为 3 至 32 位小写 snake_case，并以字母开头。',
         entityId: event.id,
         suggestion: `建议调整为 ${normalize(event.key).slice(0, 32)}。`,
+        platforms: eventActivePlatforms(event),
       })
     }
   })
@@ -209,6 +235,12 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
           detail: `共享属性别名：${overlap.join('、')}。`,
           entityId: left.event.id,
           suggestion: '统一属性字典，或明确两个字段不可互换的口径差异。',
+          platforms: [
+            ...new Set([
+              ...propertyPlatforms(left.event, left.property),
+              ...propertyPlatforms(right.event, right.property),
+            ]),
+          ],
         })
       }
     }
@@ -229,6 +261,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
             detail: `${previous.type} → ${property.type}，下游需要执行迁移兼容。`,
             entityId: event.id,
             suggestion: '确认所有下游依赖已转换为目标类型后再发布。',
+            platforms: propertyPlatforms(event, property),
           })
         }
       })
@@ -245,6 +278,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
             detail: `${rule.platform} 将 ${property.name} 列为必填，但契约属性本身标记为选填。`,
             entityId: event.id,
             suggestion: '统一平台差异说明，或在契约中标记为必填。',
+            platforms: [rule.platform],
           })
         }
       })
@@ -266,6 +300,7 @@ export const validateGovernance = (state: GovernanceState): ValidationIssue[] =>
           detail: `${event?.key ?? reference.eventId}.${deletedProperty?.name ?? reference.propertyId} 已不在当前契约中。`,
           entityId: dependency.id,
           suggestion: '要求下游完成迁移确认，或恢复属性并重新评审。',
+          platforms: event ? eventActivePlatforms(event) : undefined,
         })
       }
     })
@@ -327,25 +362,6 @@ export const validateSample = (
   })
 
   return { valid: errors.length === 0, errors, warnings }
-}
-
-export const releaseReadiness = (
-  release: ReleaseCandidate,
-  issues: ValidationIssue[],
-): number => {
-  const migrationTotal = release.migrationConfirmations.length
-  const migrationDone = release.migrationConfirmations.filter(
-    (item) => item.status === 'confirmed',
-  ).length
-  const approvalTotal = release.approvals.length
-  const approvalDone = release.approvals.filter((item) => item.status === 'approved').length
-  const issuePenalty = Math.min(
-    40,
-    issues.filter((issue) => release.eventIds.includes(issue.entityId)).length * 8,
-  )
-  const migrationScore = migrationTotal === 0 ? 40 : (migrationDone / migrationTotal) * 40
-  const approvalScore = approvalTotal === 0 ? 30 : (approvalDone / approvalTotal) * 30
-  return Math.max(0, Math.round(migrationScore + approvalScore + 30 - issuePenalty))
 }
 
 export const propertyReferences = (

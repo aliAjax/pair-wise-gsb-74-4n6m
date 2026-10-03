@@ -4,8 +4,15 @@ import type {
   EventDefinition,
   EventVersionSnapshot,
   GovernanceState,
+  ReleaseApproval,
+  ReleaseBatch,
   ReleaseCandidate,
 } from './domain'
+import {
+  batchAffectedDependencies,
+  compareBatchEvent,
+  platformsOfEvents,
+} from '@/services/batches'
 
 const events: EventDefinition[] = [
   {
@@ -779,102 +786,156 @@ const baselines: EventVersionSnapshot[] = [
   },
 ]
 
+// 十月发布候选按端推进所需的临时状态：仅用于下面按端构建批次
+const batchSeedState: GovernanceState = {
+  events,
+  scenarios: [],
+  dependencies,
+  baselines,
+  releases: [],
+  deprecations: [],
+  rollbacks: [],
+  audit: [],
+  currentVersion: '2026.10.0',
+  schemaVersion: 2,
+  publishedKeys: [],
+}
+
+const REL_001_EVENT_IDS = ['evt-001', 'evt-003', 'evt-005']
+const REL_001_PLATFORMS = platformsOfEvents(batchSeedState, REL_001_EVENT_IDS)
+
+const seedApproval = (
+  id: string,
+  role: ReleaseApproval['role'],
+  actor: string,
+  status: ReleaseApproval['status'],
+  comment: string,
+  createdAt?: string,
+): ReleaseApproval => ({ id, role, actor, status, comment, createdAt })
+
+/**
+ * 十月候选的按端批次：
+ * - Web / Server：迁移与四角色审批齐备，可独立发布；
+ * - iOS：测试审批未完成；
+ * - Android：离线补报队列未切完，dep-004 迁移确认与客户端/测试审批被卡住。
+ */
+const buildRel001Batches = (): ReleaseBatch[] =>
+  REL_001_PLATFORMS.map((platform, index) => {
+    const createdAt = '2026-09-25T10:30:00+08:00'
+    const eventIds = REL_001_EVENT_IDS.filter((eventId) => {
+      const event = events.find((item) => item.id === eventId)
+      return event?.platformRules.some((rule) => rule.platform === platform && rule.enabled)
+    })
+    const differences = eventIds
+      .map((eventId) => compareBatchEvent(batchSeedState, eventId, platform))
+      .filter((item): item is NonNullable<typeof item> => Boolean(item))
+    const affectedDependencyIds = batchAffectedDependencies(batchSeedState, platform, differences)
+
+    const migrationConfirmations = affectedDependencyIds.map((dependencyId) => {
+      const dependency = dependencies.find((item) => item.id === dependencyId)!
+      const isSearchDataset = dependencyId === 'dep-004'
+      const isTradeDashboard = dependencyId === 'dep-001'
+      const blockedByAndroid = isSearchDataset && platform === 'android'
+      // Web 与 Server 侧下游已完成 order_id 类型转换并确认；移动端尚未完成
+      const webServerConfirmed = isTradeDashboard && (platform === 'web' || platform === 'server')
+      const confirmed = (!isSearchDataset && webServerConfirmed) || (isSearchDataset && !blockedByAndroid)
+      return {
+        id: `mig-rel001-${platform}-${dependencyId}`,
+        dependencyId,
+        version: '2026.10.0',
+        status: (confirmed ? 'confirmed' : 'pending') as 'pending' | 'confirmed',
+        reviewer: dependency.owner,
+        note: blockedByAndroid
+          ? 'Android 离线补报队列未切完，page_no 数值转换尚无法验证。'
+          : isSearchDataset
+            ? '数据集已增加 page_no 数值转换。'
+            : webServerConfirmed
+              ? 'order_id 类型转换已上线，看板口径验证通过。'
+              : '',
+        confirmedAt: confirmed ? '2026-09-28T15:00:00+08:00' : undefined,
+      }
+    })
+
+    const clientReady = platform === 'web' || platform === 'server'
+    const approvals: ReleaseApproval[] = [
+      seedApproval(
+        `appr-rel001-${platform}-data`,
+        'data',
+        '顾清',
+        'approved',
+        '指标口径影响已评估。',
+        '2026-09-27T16:00:00+08:00',
+      ),
+      seedApproval(
+        `appr-rel001-${platform}-product`,
+        'product',
+        '丁禾',
+        platform === 'android' ? 'pending' : 'approved',
+        platform === 'android' ? '' : '产品侧无阻塞。',
+        platform === 'android' ? undefined : '2026-09-27T17:00:00+08:00',
+      ),
+      seedApproval(
+        `appr-rel001-${platform}-client`,
+        'client',
+        '江驰',
+        clientReady ? 'approved' : 'pending',
+        clientReady ? '客户端改造完成。' : '',
+        clientReady ? '2026-09-28T10:00:00+08:00' : undefined,
+      ),
+      seedApproval(
+        `appr-rel001-${platform}-qa`,
+        'qa',
+        '余安',
+        clientReady ? 'approved' : 'pending',
+        clientReady ? '端侧回归通过。' : '',
+        clientReady ? '2026-09-28T11:00:00+08:00' : undefined,
+      ),
+    ]
+
+    const gatesReady =
+      migrationConfirmations.every((item) => item.status === 'confirmed') &&
+      approvals.every((item) => item.status === 'approved')
+
+    return {
+      id: `batch-rel001-${platform}`,
+      releaseId: 'rel-001',
+      platform,
+      status: gatesReady ? 'approved' : 'reviewing',
+      eventIds,
+      affectedDependencyIds,
+      differences,
+      migrationConfirmations,
+      approvals,
+      dirty: false,
+      backfilled: false,
+      writeState: 'idle',
+      writeAttempts: 0,
+      createdAt,
+      updatedAt: createdAt,
+      revision: 1 + index,
+    } satisfies ReleaseBatch
+  })
+
+const rel001Batches = buildRel001Batches()
+
+const releaseRel001: ReleaseCandidate = {
+  id: 'rel-001',
+  version: '2026.10.0',
+  title: '十月核心埋点契约升级',
+  status: 'reviewing',
+  eventIds: REL_001_EVENT_IDS,
+  affectedDependencyIds: [
+    ...new Set(rel001Batches.flatMap((batch) => batch.affectedDependencyIds)),
+  ],
+  differences: rel001Batches.flatMap((batch) => batch.differences),
+  migrationConfirmations: rel001Batches.flatMap((batch) => batch.migrationConfirmations),
+  approvals: rel001Batches.flatMap((batch) => batch.approvals),
+  batches: rel001Batches,
+  createdAt: '2026-09-25T10:30:00+08:00',
+}
+
 const releases: ReleaseCandidate[] = [
-  {
-    id: 'rel-001',
-    version: '2026.10.0',
-    title: '十月核心埋点契约升级',
-    status: 'reviewing',
-    eventIds: ['evt-001', 'evt-003', 'evt-005'],
-    affectedDependencyIds: ['dep-001', 'dep-004', 'dep-005', 'dep-006'],
-    differences: [
-      {
-        eventId: 'evt-001',
-        eventKey: 'trade_order_submit',
-        addedProperties: [],
-        removedProperties: [],
-        requiredChanges: ['order_id 必填规则仍需确认'],
-        typeChanges: ['order_id: number → string'],
-        enumChanges: [],
-      },
-      {
-        eventId: 'evt-003',
-        eventKey: 'search_result_click',
-        addedProperties: [],
-        removedProperties: [],
-        requiredChanges: [],
-        typeChanges: ['page_no: string → number'],
-        enumChanges: ['click_type 新增 keyboard'],
-      },
-    ],
-    migrationConfirmations: [
-      {
-        id: 'mig-001',
-        dependencyId: 'dep-001',
-        version: '2026.10.0',
-        status: 'pending',
-        reviewer: '数据产品组',
-        note: '',
-      },
-      {
-        id: 'mig-002',
-        dependencyId: 'dep-004',
-        version: '2026.10.0',
-        status: 'confirmed',
-        reviewer: '搜索数据组',
-        note: '数据集已增加 page_no 数值转换。',
-        confirmedAt: '2026-09-27T14:20:00+08:00',
-      },
-      {
-        id: 'mig-003',
-        dependencyId: 'dep-005',
-        version: '2026.10.0',
-        status: 'pending',
-        reviewer: '增长实验组',
-        note: '等待实验口径冻结后确认。',
-      },
-      {
-        id: 'mig-004',
-        dependencyId: 'dep-006',
-        version: '2026.10.0',
-        status: 'pending',
-        reviewer: '营销数据组',
-        note: '旧事件下线前保持只读兼容。',
-      },
-    ],
-    approvals: [
-      {
-        id: 'appr-001',
-        role: 'data',
-        actor: '顾清',
-        status: 'approved',
-        comment: '指标口径影响已评估。',
-        createdAt: '2026-09-27T16:00:00+08:00',
-      },
-      {
-        id: 'appr-002',
-        role: 'product',
-        actor: '丁禾',
-        status: 'pending',
-        comment: '',
-      },
-      {
-        id: 'appr-003',
-        role: 'client',
-        actor: '江驰',
-        status: 'pending',
-        comment: '',
-      },
-      {
-        id: 'appr-004',
-        role: 'qa',
-        actor: '余安',
-        status: 'pending',
-        comment: '',
-      },
-    ],
-    createdAt: '2026-09-25T10:30:00+08:00',
-  },
+  releaseRel001,
   {
     id: 'rel-000',
     version: '2026.09.0',
@@ -937,10 +998,12 @@ const releases: ReleaseCandidate[] = [
         createdAt: '2026-08-30T11:50:00+08:00',
       },
     ],
+    // 历史发布无端批次：加载时由 migrateState 按当时平台规则兼容回填
     createdAt: '2026-08-25T09:00:00+08:00',
     publishedAt: '2026-08-30T12:00:00+08:00',
   },
 ]
+
 
 const audit: AuditEvent[] = [
   {
@@ -1052,4 +1115,6 @@ export const createSeedState = (): GovernanceState => ({
   ],
   audit,
   currentVersion: '2026.10.0',
+  schemaVersion: 2,
+  publishedKeys: [],
 })

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   AppIcon,
@@ -12,7 +13,7 @@ import {
   RollbackIcon,
   SettingIcon,
 } from 'tdesign-icons-vue-next'
-import { DialogPlugin } from 'tdesign-vue-next'
+import { DialogPlugin, MessagePlugin } from 'tdesign-vue-next'
 import { useGovernanceStore } from '@/stores/governance'
 
 const router = useRouter()
@@ -28,6 +29,21 @@ const navigation = [
   { label: '回滚记录', icon: RollbackIcon, to: '/rollbacks' },
   { label: '契约导出', icon: AppIcon, to: '/export' },
 ]
+
+/**
+ * 多窗口并发：另一窗口完成写入时，本窗口收到 storage 事件。
+ * 重载最新状态，并保留当前页面的冲突提示——后到方提交时仍会基于 revision 保留草稿。
+ */
+const handleStorage = (event: StorageEvent): void => {
+  if (!event.key || event.key.indexOf('eventrail-governance') === -1) return
+  store.reloadFromStorage()
+  const detail = '另一窗口已更新契约数据，本窗口已同步最新版本；如正在提交同一端批次，你的提交将作为草稿保留并提示冲突。'
+  store.notifyExternalWrite(detail)
+  void MessagePlugin.warning('检测到其他窗口的发布写入，已同步最新状态')
+}
+
+onMounted(() => window.addEventListener('storage', handleStorage))
+onUnmounted(() => window.removeEventListener('storage', handleStorage))
 
 const reset = (): void => {
   const dialog = DialogPlugin.confirm({
@@ -78,7 +94,7 @@ const reset = (): void => {
     <main class="main-shell">
       <header class="topbar">
         <div>
-          <strong>多端埋点事件治理与发布评审</strong>
+          <strong>多端埋点事件治理与按端发布评审</strong>
           <span>{{ store.data.events.length }} 个事件 · {{ store.data.dependencies.length }} 个下游依赖</span>
         </div>
         <div class="topbar-actions">
@@ -92,6 +108,10 @@ const reset = (): void => {
           </t-button>
         </div>
       </header>
+      <section v-if="store.externalWriteNotice" class="cross-window-banner">
+        <span>{{ store.externalWriteNotice }}</span>
+        <t-button size="small" variant="text" @click="store.clearExternalNotice()">知道了</t-button>
+      </section>
       <section class="content-shell">
         <RouterView />
       </section>
@@ -245,6 +265,18 @@ const reset = (): void => {
 
 .sync-state {
   gap: 7px;
+}
+
+.cross-window-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 8px 24px;
+  color: #8a5a00;
+  font-size: 12px;
+  background: #fff4e7;
+  border-bottom: 1px solid #f3d8ae;
 }
 
 .content-shell {

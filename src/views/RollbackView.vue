@@ -9,6 +9,7 @@ import {
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import { PLATFORM_LABELS, type Platform } from '@/models/domain'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
@@ -17,6 +18,7 @@ const verifyVisible = ref(false)
 const selectedRollbackId = ref('')
 const form = reactive({
   releaseId: store.data.releases[0]?.id ?? '',
+  batchId: '' as string,
   reason: '',
   scope: '',
   evidence: '',
@@ -25,19 +27,68 @@ const verifyForm = reactive({
   evidence: '',
 })
 
+const rollbackReleases = computed(() =>
+  store.data.releases
+    .filter(
+      (release) =>
+        release.status === 'published' ||
+        release.status === 'partially_published' ||
+        release.batches?.some((batch) => batch.status === 'published'),
+    )
+    .map((release) => ({
+      label: `${release.version} ${release.title}`,
+      value: release.id,
+    })),
+)
+
+const formRelease = computed(() =>
+  store.data.releases.find((release) => release.id === form.releaseId),
+)
+const formBatches = computed(() =>
+  (formRelease.value?.batches ?? []).filter(
+    (batch) => batch.status === 'published' || batch.status === 'rolled_back',
+  ),
+)
+const batchOptions = computed(() =>
+  formBatches.value.map((batch) => ({
+    label: `${PLATFORM_LABELS[batch.platform]} 端（${batch.status === 'rolled_back' ? '已回滚' : '已发布'}）`,
+    value: batch.id,
+  })),
+)
+
 const rollbackRecords = computed(() =>
   store.data.rollbacks.map((record) => ({
     ...record,
     release: store.data.releases.find((release) => release.id === record.releaseId),
+    batch: store.data.releases
+      .flatMap((release) => release.batches ?? [])
+      .find((batch) => batch.id === record.batchId),
   })),
 )
 
+const platformLabel = (platform?: Platform): string =>
+  platform ? PLATFORM_LABELS[platform] : '整版（历史）'
+
 const openRollback = (): void => {
-  form.releaseId = store.data.releases.find((release) => release.status === 'published')?.id ?? ''
+  const target =
+    store.data.releases.find((release) => release.status === 'partially_published') ??
+    store.data.releases.find(
+      (release) =>
+        release.status === 'published' ||
+        release.batches?.some((batch) => batch.status === 'published'),
+    )
+  form.releaseId = target?.id ?? ''
+  form.batchId =
+    target?.batches?.find((batch) => batch.status === 'published')?.id ?? ''
   form.reason = ''
   form.scope = ''
   form.evidence = ''
   rollbackVisible.value = true
+}
+
+const onReleaseChange = (): void => {
+  form.batchId =
+    formBatches.value.find((batch) => batch.status === 'published')?.id ?? ''
 }
 
 const execute = async (): Promise<void> => {
@@ -45,9 +96,17 @@ const execute = async (): Promise<void> => {
     await MessagePlugin.error('版本、回滚原因、影响范围和证据编号不能为空')
     return
   }
-  store.executeRollback(form.releaseId, form.reason, form.scope, form.evidence)
+  store.executeRollback(
+    form.releaseId,
+    form.reason,
+    form.scope,
+    form.evidence,
+    form.batchId || undefined,
+  )
   rollbackVisible.value = false
-  await MessagePlugin.success('回滚指令已记录，请继续执行结果验证')
+  await MessagePlugin.success(
+    form.batchId ? '端批次回滚指令已记录，不影响其他稳定端' : '回滚指令已记录，请继续执行结果验证',
+  )
 }
 
 const openVerify = (rollbackId: string): void => {
@@ -121,7 +180,9 @@ const verify = async (): Promise<void> => {
             <div class="rollback-head">
               <div>
                 <strong>{{ record.version }}</strong>
-                <span>{{ record.release?.title ?? '历史发布版本' }}</span>
+                <span>
+                  {{ record.release?.title ?? '历史发布版本' }} · {{ platformLabel(record.platform) }}
+                </span>
               </div>
               <StatusTag :value="record.status" />
             </div>
@@ -159,18 +220,23 @@ const verify = async (): Promise<void> => {
       </div>
     </section>
 
-    <t-dialog v-model:visible="rollbackVisible" header="执行契约回滚" width="680px" :footer="false">
+    <t-dialog v-model:visible="rollbackVisible" header="执行契约回滚（按端批次）" width="680px" :footer="false">
       <div class="editor-form">
         <div class="field field-wide">
           <label>回滚目标版本</label>
           <t-select
             v-model="form.releaseId"
-            :options="
-              store.data.releases.map((release) => ({
-                label: `${release.version} ${release.title}`,
-                value: release.id,
-              }))
-            "
+            :options="rollbackReleases"
+            @change="onReleaseChange"
+          />
+        </div>
+        <div class="field field-wide">
+          <label>回滚端批次（仅回滚该端，其他已发布端不受牵连；留空表示整版历史回滚）</label>
+          <t-select
+            v-model="form.batchId"
+            :options="batchOptions"
+            placeholder="选择端批次"
+            clearable
           />
         </div>
         <div class="field field-wide">

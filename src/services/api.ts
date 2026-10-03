@@ -2,6 +2,8 @@ import axios, { type AxiosAdapter } from 'axios'
 import type {
   DownstreamDependency,
   EventDefinition,
+  Platform,
+  ReleaseBatch,
   ReleaseCandidate,
   ValidationIssue,
 } from '@/models/domain'
@@ -15,6 +17,14 @@ export interface EventListFilters {
   category?: string
 }
 
+export interface PlatformBatchSummary {
+  platform: Platform
+  total: number
+  published: number
+  pendingMigrations: number
+  pendingApprovals: number
+}
+
 export interface DashboardPayload {
   eventCount: number
   activeEventCount: number
@@ -24,11 +34,39 @@ export interface DashboardPayload {
   validationIssueCount: number
   criticalIssueCount: number
   currentRelease: ReleaseCandidate | null
+  batchSummaries: PlatformBatchSummary[]
 }
 
 export interface LineagePayload {
   events: EventDefinition[]
   dependencies: DownstreamDependency[]
+}
+
+const summarizeBatches = (releases: ReleaseCandidate[]): PlatformBatchSummary[] => {
+  const map = new Map<Platform, PlatformBatchSummary>()
+  releases
+    .flatMap((release) => release.batches ?? [])
+    .forEach((batch: ReleaseBatch) => {
+      const summary =
+        map.get(batch.platform) ??
+        ({
+          platform: batch.platform,
+          total: 0,
+          published: 0,
+          pendingMigrations: 0,
+          pendingApprovals: 0,
+        } satisfies PlatformBatchSummary)
+      summary.total += 1
+      if (batch.status === 'published') summary.published += 1
+      summary.pendingMigrations += batch.migrationConfirmations.filter(
+        (item) => item.status !== 'confirmed',
+      ).length
+      summary.pendingApprovals += batch.approvals.filter(
+        (item) => item.status === 'pending',
+      ).length
+      map.set(batch.platform, summary)
+    })
+  return [...map.values()]
 }
 
 const localAdapter: AxiosAdapter = async (config) => {
@@ -38,7 +76,18 @@ const localAdapter: AxiosAdapter = async (config) => {
   if (url === '/dashboard') {
     const issues = validateGovernance(state)
     const currentRelease =
-      state.releases.find((release) => release.status === 'reviewing') ?? state.releases[0] ?? null
+      state.releases.find((release) =>
+        release.batches?.some((batch) => batch.status !== 'published'),
+      ) ??
+      state.releases.find((release) => release.status === 'reviewing') ??
+      state.releases[0] ??
+      null
+    const allBatches = state.releases.flatMap((release) => release.batches ?? [])
+    const pendingMigrations = allBatches.reduce(
+      (count, batch) =>
+        count + batch.migrationConfirmations.filter((item) => item.status === 'pending').length,
+      0,
+    )
     const data: DashboardPayload = {
       eventCount: state.events.length,
       activeEventCount: state.events.filter((event) =>
@@ -48,11 +97,11 @@ const localAdapter: AxiosAdapter = async (config) => {
         ['draft', 'reviewing'].includes(event.status),
       ).length,
       dependencyCount: state.dependencies.length,
-      pendingMigrations:
-        currentRelease?.migrationConfirmations.filter((item) => item.status === 'pending').length ?? 0,
+      pendingMigrations,
       validationIssueCount: issues.length,
       criticalIssueCount: issues.filter((issue) => issue.severity === 'critical').length,
       currentRelease,
+      batchSummaries: summarizeBatches(state.releases),
     }
     return {
       data,

@@ -5,7 +5,13 @@ import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
 import { useValidationQuery } from '@/composables/useGovernanceQueries'
-import type { EventDefinition, SampleValidationResult } from '@/models/domain'
+import {
+  ALL_PLATFORMS,
+  PLATFORM_LABELS,
+  type EventDefinition,
+  type Platform,
+  type SampleValidationResult,
+} from '@/models/domain'
 import { validateSample } from '@/services/selectors'
 import { useGovernanceStore } from '@/stores/governance'
 
@@ -15,9 +21,16 @@ const issues = computed(() => validationQuery.data.value ?? store.issues)
 
 const kindFilter = ref('')
 const severityFilter = ref('')
+const platformFilter = ref<Platform | ''>('')
 const selectedEventId = ref(store.data.events[0]?.id ?? '')
+const samplePlatform = ref<Platform | ''>('')
 const sampleText = ref('')
 const validationResult = ref<SampleValidationResult | null>(null)
+
+const platformOptions = ALL_PLATFORMS.map((platform) => ({
+  label: PLATFORM_LABELS[platform],
+  value: platform,
+}))
 
 const kindOptions = [
   { label: '重复事件', value: 'duplicate_event' },
@@ -38,17 +51,24 @@ const filteredIssues = computed(() =>
   issues.value.filter(
     (issue) =>
       (!kindFilter.value || issue.kind === kindFilter.value) &&
-      (!severityFilter.value || issue.severity === severityFilter.value),
+      (!severityFilter.value || issue.severity === severityFilter.value) &&
+      (!platformFilter.value ||
+        !issue.platforms ||
+        issue.platforms.length === 0 ||
+        issue.platforms.includes(platformFilter.value)),
   ),
 )
 const selectedEvent = computed(
   () => store.data.events.find((event) => event.id === selectedEventId.value) ?? null,
 )
 
-const sampleForEvent = (event: EventDefinition): string => {
+const sampleForEvent = (event: EventDefinition, platform: Platform | ''): string => {
   const payload: Record<string, unknown> = {}
   event.properties
-    .filter((property) => !property.deletedAt)
+    .filter(
+      (property) =>
+        !property.deletedAt && (!platform || property.platforms.includes(platform)),
+    )
     .forEach((property) => {
       if (!property.required && property.name === 'coupon_id') return
       switch (property.type) {
@@ -76,9 +96,9 @@ const sampleForEvent = (event: EventDefinition): string => {
 }
 
 watch(
-  selectedEvent,
-  (event) => {
-    sampleText.value = event ? sampleForEvent(event) : '{}'
+  [selectedEvent, samplePlatform],
+  ([event, platform]) => {
+    sampleText.value = event ? sampleForEvent(event, platform as Platform | '') : '{}'
     validationResult.value = null
   },
   { immediate: true },
@@ -88,7 +108,16 @@ const runValidation = async (): Promise<void> => {
   if (!selectedEvent.value) return
   try {
     const parsed = JSON.parse(sampleText.value) as Record<string, unknown>
-    validationResult.value = validateSample(selectedEvent.value, parsed)
+    // 按端校验：非该端属性在该端批次中不存在
+    const platformEvent: EventDefinition = samplePlatform.value
+      ? {
+          ...selectedEvent.value,
+          properties: selectedEvent.value.properties.filter((property) =>
+            property.platforms.includes(samplePlatform.value as Platform),
+          ),
+        }
+      : selectedEvent.value
+    validationResult.value = validateSample(platformEvent, parsed)
     if (validationResult.value.valid) {
       await MessagePlugin.success('示例通过当前契约校验')
     } else {
@@ -128,6 +157,15 @@ const runValidation = async (): Promise<void> => {
             clearable
           />
         </div>
+        <div class="toolbar-field">
+          <span>端批次</span>
+          <t-select
+            v-model="platformFilter"
+            :options="platformOptions"
+            placeholder="全部端"
+            clearable
+          />
+        </div>
         <div class="filter-actions">
           <t-button variant="outline" @click="validationQuery.refetch()">
             <template #icon><SearchIcon /></template>
@@ -156,6 +194,9 @@ const runValidation = async (): Promise<void> => {
               <small>{{ issue.suggestion }}</small>
             </div>
             <div class="issue-tags">
+              <span v-for="platform in issue.platforms ?? []" :key="platform" class="issue-platform">
+                {{ PLATFORM_LABELS[platform] }}
+              </span>
               <StatusTag :value="issue.severity" />
               <StatusTag :value="issue.kind" />
             </div>
@@ -184,6 +225,15 @@ const runValidation = async (): Promise<void> => {
                 }))
               "
               filterable
+            />
+          </div>
+          <div class="field">
+            <label>按端批次校验</label>
+            <t-select
+              v-model="samplePlatform"
+              :options="platformOptions"
+              placeholder="全端契约"
+              clearable
             />
           </div>
           <div class="field">
@@ -243,6 +293,15 @@ const runValidation = async (): Promise<void> => {
   display: flex;
   gap: 6px;
   align-items: center;
+  flex-wrap: wrap;
+}
+
+.issue-platform {
+  padding: 1px 7px;
+  border-radius: 4px;
+  color: #1264c5;
+  background: #e8f1fd;
+  font-size: 10px;
 }
 
 .sample-panel {

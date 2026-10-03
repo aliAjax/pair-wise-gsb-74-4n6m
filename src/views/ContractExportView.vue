@@ -4,9 +4,17 @@ import { CheckCircleIcon, DownloadIcon } from 'tdesign-icons-vue-next'
 import { MessagePlugin } from 'tdesign-vue-next'
 import PageHeader from '@/components/PageHeader.vue'
 import StatusTag from '@/components/StatusTag.vue'
+import {
+  ALL_PLATFORMS,
+  PLATFORM_LABELS,
+  type Platform,
+  type ReleaseBatch,
+} from '@/models/domain'
 import { useGovernanceStore } from '@/stores/governance'
 
 const store = useGovernanceStore()
+const exportPlatform = ref<Platform | ''>('')
+const exportBatchId = ref('')
 const selectedEventIds = ref(
   store.data.events
     .filter((event) => ['approved', 'published', 'reviewing'].includes(event.status))
@@ -15,52 +23,122 @@ const selectedEventIds = ref(
 const format = ref<'json' | 'markdown'>('json')
 const includeDeprecated = ref(false)
 
-const eligibleEvents = computed(() =>
-  store.data.events.filter((event) => includeDeprecated.value || event.status !== 'retired'),
+const platformOptions = ALL_PLATFORMS.map((platform) => ({
+  label: PLATFORM_LABELS[platform],
+  value: platform,
+}))
+
+/** 可选端批次：来自所有发布候选，按端分组展示 */
+const batchOptions = computed(
+  () => {
+    const options: { label: string; value: string; batch: ReleaseBatch }[] = []
+    store.data.releases.forEach((release) => {
+      release.batches?.forEach((batch) => {
+        if (exportPlatform.value && batch.platform !== exportPlatform.value) return
+        options.push({
+          label: `${release.version} / ${PLATFORM_LABELS[batch.platform]}（${batch.eventIds.length} 事件）`,
+          value: batch.id,
+          batch,
+        })
+      })
+    })
+    return options
+  },
 )
 
-watch(includeDeprecated, () => {
+const selectedBatch = computed<ReleaseBatch | null>(
+  () => batchOptions.value.find((item) => item.value === exportBatchId.value)?.batch ?? null,
+)
+
+/** 勾选导出批次时，事件范围收敛为该端批次事件 */
+watch(exportBatchId, (batchId) => {
+  if (!batchId) return
+  const batch = store.data.releases
+    .flatMap((release) => release.batches ?? [])
+    .find((item) => item.id === batchId)
+  if (batch) {
+    exportPlatform.value = batch.platform
+    selectedEventIds.value = [...batch.eventIds]
+  }
+})
+
+const eligibleEvents = computed(() =>
+  store.data.events.filter((event) => {
+    if (includeDeprecated.value === false && event.status === 'retired') return false
+    if (exportPlatform.value) {
+      return event.platformRules.some(
+        (rule) => rule.platform === exportPlatform.value && rule.enabled,
+      )
+    }
+    return true
+  }),
+)
+
+watch([includeDeprecated, exportPlatform], () => {
   selectedEventIds.value = selectedEventIds.value.filter((id) =>
     eligibleEvents.value.some((event) => event.id === id),
   )
 })
 
 const markdown = computed(() => {
-  const events = store.data.events.filter((event) => selectedEventIds.value.includes(event.id))
+  const events = store.data.events.filter(
+    (event) =>
+      selectedEventIds.value.includes(event.id) &&
+      (!exportPlatform.value ||
+        event.platformRules.some(
+          (rule) => rule.platform === exportPlatform.value && rule.enabled,
+        )),
+  )
+  const platformTitle = exportPlatform.value ? `（${PLATFORM_LABELS[exportPlatform.value as Platform]} 端批次）` : ''
   return [
-    `# 埋点事件契约 ${store.data.currentVersion}`,
+    `# 埋点事件契约 ${store.data.currentVersion}${platformTitle}`,
+    selectedBatch.value ? `> 发布批次：${selectedBatch.value.releaseId} / ${PLATFORM_LABELS[selectedBatch.value.platform]}` : '',
     '',
-    ...events.flatMap((event) => [
-      `## ${event.displayName} (\`${event.key}\`)`,
-      '',
-      `- 版本：${event.version}`,
-      `- 负责人：${event.owner}`,
-      `- 状态：${event.status}`,
-      `- 触发时机：${event.trigger}`,
-      '',
-      '| 属性 | 类型 | 必填 | 枚举 | 说明 |',
-      '| --- | --- | --- | --- | --- |',
-      ...event.properties
-        .filter((property) => !property.deletedAt)
-        .map(
+    ...events.flatMap((event) => {
+      const platformRule = exportPlatform.value
+        ? event.platformRules.find((rule) => rule.platform === exportPlatform.value)
+        : undefined
+      const properties = event.properties.filter(
+        (property) =>
+          !property.deletedAt &&
+          (!exportPlatform.value || property.platforms.includes(exportPlatform.value as Platform)),
+      )
+      return [
+        `## ${event.displayName} (\`${event.key}\`)`,
+        '',
+        `- 版本：${event.version}`,
+        `- 负责人：${event.owner}`,
+        `- 状态：${event.status}`,
+        `- 触发时机：${platformRule?.trigger ?? event.trigger}`,
+        '',
+        '| 属性 | 类型 | 必填 | 枚举 | 说明 |',
+        '| --- | --- | --- | --- | --- |',
+        ...properties.map(
           (property) =>
             `| ${property.name} | ${property.type} | ${property.required ? '是' : '否'} | ${property.enumValues.join('/') || '-'} | ${property.description} |`,
         ),
-      '',
-      '**平台差异**',
-      '',
-      ...event.platformRules.map(
-        (rule) =>
-          `- ${rule.platform}: ${rule.enabled ? rule.trigger : '已停用'}（${rule.owner}）`,
-      ),
-      '',
-    ]),
+        '',
+        '**平台差异**',
+        '',
+        ...event.platformRules
+          .filter((rule) => !exportPlatform.value || rule.platform === exportPlatform.value)
+          .map(
+            (rule) =>
+              `- ${rule.platform}: ${rule.enabled ? rule.trigger : '已停用'}（${rule.owner}）`,
+          ),
+        '',
+      ]
+    }),
   ].join('\n')
 })
 
-const output = computed(() =>
-  format.value === 'json' ? store.exportContract(selectedEventIds.value) : markdown.value,
-)
+const output = computed(() => {
+  if (format.value === 'markdown') return markdown.value
+  if (selectedBatch.value) {
+    return store.exportBatchContract(selectedBatch.value.releaseId, selectedBatch.value.id)
+  }
+  return store.exportContract(selectedEventIds.value, exportPlatform.value || undefined)
+})
 
 const download = async (): Promise<void> => {
   if (selectedEventIds.value.length === 0) {
@@ -68,6 +146,7 @@ const download = async (): Promise<void> => {
     return
   }
   const extension = format.value === 'json' ? 'json' : 'md'
+  const suffix = exportPlatform.value ? `-${exportPlatform.value}` : ''
   const mime =
     format.value === 'json'
       ? 'application/json;charset=utf-8'
@@ -76,10 +155,10 @@ const download = async (): Promise<void> => {
   const url = URL.createObjectURL(blob)
   const anchor = document.createElement('a')
   anchor.href = url
-  anchor.download = `event-contract-${store.data.currentVersion}.${extension}`
+  anchor.download = `event-contract-${store.data.currentVersion}${suffix}.${extension}`
   anchor.click()
   URL.revokeObjectURL(url)
-  await MessagePlugin.success('契约文件已导出')
+  await MessagePlugin.success('端批次契约文件已导出')
 }
 
 const setExportSelection = (eventId: string, checked: unknown): void => {
@@ -119,6 +198,33 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
             </span>
           </label>
         </div>
+        <div class="scope-fields">
+          <div class="field">
+            <label>按端批次</label>
+            <t-select
+              v-model="exportPlatform"
+              :options="platformOptions"
+              placeholder="全部端"
+              clearable
+            />
+          </div>
+          <div class="field">
+            <label>选择已生成批次（自动收敛事件范围）</label>
+            <t-select
+              v-model="exportBatchId"
+              :options="batchOptions"
+              placeholder="不指定批次"
+              clearable
+              filterable
+            />
+          </div>
+        </div>
+        <span v-if="selectedBatch" class="batch-hint">
+          <StatusTag :value="selectedBatch.status" />
+          <span v-if="selectedBatch.backfilled">历史数据按当时平台规则回填</span>
+          <span v-else-if="selectedBatch.dirty">该批次契约已变更，建议先重算</span>
+          <span v-else>该端批次差异、迁移与审批按端独立</span>
+        </span>
         <label class="deprecated-option">
           <t-checkbox v-model="includeDeprecated" />
           <span>包含已废弃但仍保留历史口径的事件</span>
@@ -207,6 +313,32 @@ const setExportSelection = (eventId: string, checked: unknown): void => {
   padding: 14px 16px;
   color: #596579;
   font-size: 12px;
+}
+
+.scope-fields {
+  display: grid;
+  gap: 10px;
+  padding: 14px 16px;
+  border-top: 1px solid #e8ebef;
+}
+
+.scope-fields .field {
+  display: grid;
+  gap: 6px;
+}
+
+.scope-fields label {
+  color: #596579;
+  font-size: 11px;
+}
+
+.batch-hint {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 16px 12px;
+  color: #7a8494;
+  font-size: 11px;
 }
 
 .event-checklist {
